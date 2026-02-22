@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Article Reader</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        surface: { DEFAULT: '#0f0f1a', light: '#1a1a2e', card: '#16213e' },
+                        accent: { DEFAULT: '#e94560', hover: '#ff6b81', dim: 'rgba(233,69,96,0.15)' },
+                    },
+                    fontFamily: {
+                        serif: ['Georgia', 'Cambria', '"Times New Roman"', 'serif'],
+                        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Inter', system-ui, sans-serif; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #e94560; }
+
+        /* Animations */
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(16px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes shimmer {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+        @keyframes pulse-ring {
+            0% { box-shadow: 0 0 0 0 rgba(233, 69, 96, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(233, 69, 96, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(233, 69, 96, 0); }
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .fade-up { animation: fadeUp 0.4s ease-out both; }
+        .fade-up-delay { animation: fadeUp 0.4s ease-out 0.1s both; }
+
+        .skeleton {
+            background: linear-gradient(90deg, #1a1a2e 25%, #2a2a4a 50%, #1a1a2e 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite;
+            border-radius: 8px;
+        }
+
+        .spinner {
+            width: 20px; height: 20px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top-color: #e94560;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            display: inline-block;
+        }
+
+        /* Input glow */
+        #url-input:focus {
+            box-shadow: 0 0 0 3px rgba(233, 69, 96, 0.25), 0 0 20px rgba(233, 69, 96, 0.1);
+        }
+
+        /* Toggle pill */
+        .toggle-btn {
+            transition: all 0.25s ease;
+            position: relative;
+            z-index: 1;
+        }
+        .toggle-btn.active {
+            color: white;
+        }
+        .toggle-bg {
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        /* Article prose */
+        .article-prose p {
+            margin-bottom: 1.25em;
+            line-height: 1.85;
+        }
+        .article-prose a {
+            color: #e94560;
+            text-decoration: underline;
+            text-decoration-color: rgba(233,69,96,0.3);
+            text-underline-offset: 3px;
+        }
+        .article-prose a:hover {
+            text-decoration-color: #e94560;
+        }
+
+        /* Button hover effect */
+        .btn-primary {
+            background: linear-gradient(135deg, #e94560 0%, #c73e54 100%);
+            transition: all 0.25s ease;
+        }
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 20px rgba(233, 69, 96, 0.4);
+        }
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        /* Card glass effect */
+        .glass-card {
+            background: rgba(22, 33, 62, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+    </style>
+</head>
+<body class="bg-surface text-gray-200 min-h-screen antialiased">
+
+    <div id="app" class="max-w-4xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
+
+        <!-- Header -->
+        <header class="text-center mb-10 fade-up">
+            <h1 class="text-3xl sm:text-4xl font-bold tracking-tight">
+                <span class="text-white">Article</span><span class="text-accent">Reader</span>
+            </h1>
+            <p class="text-gray-500 mt-2 text-sm">Paste a link. Read anything.</p>
+        </header>
+
+        <!-- URL Input -->
+        <div class="glass-card rounded-2xl p-5 sm:p-6 mb-8 fade-up-delay">
+            <div class="flex gap-3">
+                <input
+                    id="url-input"
+                    type="url"
+                    placeholder="Paste article URL here..."
+                    class="flex-1 bg-surface border border-gray-700/50 rounded-xl px-4 py-3 text-white placeholder-gray-500 outline-none transition-all duration-300 text-sm sm:text-base"
+                    autocomplete="off"
+                    spellcheck="false"
+                >
+                <button
+                    id="fetch-btn"
+                    class="btn-primary text-white font-medium px-6 py-3 rounded-xl text-sm sm:text-base whitespace-nowrap"
+                >
+                    Read
+                </button>
+            </div>
+        </div>
+
+        <!-- Loading State -->
+        <div id="loading" class="hidden">
+            <div class="glass-card rounded-2xl p-6 sm:p-8">
+                <div class="flex items-center gap-3 mb-6">
+                    <div class="spinner"></div>
+                    <span id="loading-text" class="text-gray-400 text-sm">Fetching article...</span>
+                </div>
+                <div class="space-y-4">
+                    <div class="skeleton h-8 w-3/4"></div>
+                    <div class="skeleton h-4 w-1/3"></div>
+                    <div class="space-y-2 mt-6">
+                        <div class="skeleton h-4 w-full"></div>
+                        <div class="skeleton h-4 w-full"></div>
+                        <div class="skeleton h-4 w-5/6"></div>
+                        <div class="skeleton h-4 w-full"></div>
+                        <div class="skeleton h-4 w-2/3"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Error State -->
+        <div id="error" class="hidden fade-up">
+            <div class="bg-red-500/10 border border-red-500/20 rounded-2xl p-5 flex items-start gap-3">
+                <svg class="w-5 h-5 text-red-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <div>
+                    <p class="text-red-400 font-medium text-sm">Failed to load article</p>
+                    <p id="error-text" class="text-red-400/70 text-sm mt-1"></p>
+                </div>
+                <button id="error-close" class="ml-auto text-red-400/50 hover:text-red-400 transition-colors">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- Results Area -->
+        <div id="results" class="hidden fade-up">
+
+            <!-- Toolbar -->
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
+                <!-- View Toggle -->
+                <div class="relative bg-surface-light rounded-xl p-1 flex">
+                    <div id="toggle-indicator" class="toggle-bg absolute top-1 bottom-1 w-[calc(50%-4px)] bg-accent rounded-lg"></div>
+                    <button id="toggle-clean" class="toggle-btn active px-4 py-2 rounded-lg text-sm font-medium w-28 text-center">
+                        Clean View
+                    </button>
+                    <button id="toggle-full" class="toggle-btn px-4 py-2 rounded-lg text-sm font-medium text-gray-400 w-28 text-center">
+                        Full View
+                    </button>
+                </div>
+
+                <!-- Actions -->
+                <div class="flex items-center gap-3">
+                    <button
+                        id="translate-btn"
+                        class="flex items-center gap-2 bg-surface-light hover:bg-surface-card border border-gray-700/50 px-4 py-2 rounded-xl text-sm font-medium text-gray-300 hover:text-white transition-all duration-200"
+                    >
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129"/>
+                        </svg>
+                        <span id="translate-label">Translate to English</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Strategy badge -->
+            <div id="strategy-badge" class="mb-4 hidden">
+                <span class="inline-flex items-center gap-1.5 bg-green-500/10 text-green-400 text-xs font-medium px-3 py-1 rounded-full border border-green-500/20">
+                    <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/>
+                    </svg>
+                    <span id="strategy-text"></span>
+                </span>
+            </div>
+
+            <!-- Clean View -->
+            <div id="clean-view">
+                <div class="glass-card rounded-2xl p-6 sm:p-10">
+                    <h1 id="article-title" class="text-2xl sm:text-3xl font-bold text-white leading-tight mb-4 font-serif"></h1>
+                    <div id="article-meta" class="flex flex-wrap items-center gap-2 text-sm text-gray-500 mb-8 pb-6 border-b border-gray-700/30"></div>
+                    <div id="article-text" class="article-prose text-gray-300 text-base sm:text-[17px] leading-relaxed"></div>
+                </div>
+            </div>
+
+            <!-- Full View -->
+            <div id="full-view" class="hidden">
+                <div class="glass-card rounded-2xl overflow-hidden">
+                    <iframe
+                        id="full-view-frame"
+                        sandbox="allow-same-origin"
+                        class="w-full border-0"
+                        style="min-height: 60vh;"
+                    ></iframe>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+(function () {
+    // === STATE ===
+    const state = {
+        rawHtml: null,
+        cleanHtml: null,
+        cleanHtmlOriginal: null,   // original full-view HTML (before translation)
+        cleanHtmlTranslated: null, // translated full-view HTML
+        extractedData: null,
+        translatedText: null,
+        translatedTitle: null,     // translated article title
+        currentView: 'clean',
+        isTranslated: false,
+        loading: false,
+    };
+
+    // === DOM ===
+    const $ = (s) => document.querySelector(s);
+    const el = {
+        urlInput:       $('#url-input'),
+        fetchBtn:       $('#fetch-btn'),
+        loading:        $('#loading'),
+        loadingText:    $('#loading-text'),
+        error:          $('#error'),
+        errorText:      $('#error-text'),
+        errorClose:     $('#error-close'),
+        results:        $('#results'),
+        cleanView:      $('#clean-view'),
+        fullView:       $('#full-view'),
+        fullViewFrame:  $('#full-view-frame'),
+        articleTitle:   $('#article-title'),
+        articleMeta:    $('#article-meta'),
+        articleText:    $('#article-text'),
+        translateBtn:   $('#translate-btn'),
+        translateLabel: $('#translate-label'),
+        toggleClean:    $('#toggle-clean'),
+        toggleFull:     $('#toggle-full'),
+        toggleIndicator:$('#toggle-indicator'),
+        strategyBadge:  $('#strategy-badge'),
+        strategyText:   $('#strategy-text'),
+    };
+
+    // === HELPERS ===
+    function show(elem) { elem.classList.remove('hidden'); }
+    function hide(elem) { elem.classList.add('hidden'); }
+
+    function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+    }
+
+    function textToHtml(text) {
+        return text
+            .split(/\n\n+/)
+            .filter(p => p.trim())
+            .map(p => `<p>${escapeHtml(p.trim())}</p>`)
+            .join('');
+    }
+
+    // === API CALLS ===
+    async function apiFetch(url) {
+        const res = await fetch('/api/fetch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || `Fetch failed (${res.status})`);
+        }
+        return res.json();
+    }
+
+    async function apiExtract(html, url) {
+        const res = await fetch('/api/extract', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ html, url }),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || `Extraction failed (${res.status})`);
+        }
+        return res.json();
+    }
+
+    async function apiTranslate(text) {
+        const res = await fetch('/api/translate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, source_lang: 'auto', target_lang: 'en' }),
+        });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || `Translation failed (${res.status})`);
+        }
+        return res.json();
+    }
+
+    // === UI UPDATES ===
+    function showLoading(msg) {
+        state.loading = true;
+        el.loadingText.textContent = msg;
+        show(el.loading);
+        hide(el.error);
+        hide(el.results);
+    }
+
+    function hideLoading() {
+        state.loading = false;
+        hide(el.loading);
+    }
+
+    function showError(msg) {
+        hideLoading();
+        el.errorText.textContent = msg;
+        show(el.error);
+    }
+
+    function renderCleanView(data) {
+        el.articleTitle.textContent = data.title || 'Untitled Article';
+
+        // Meta row
+        el.articleMeta.innerHTML = '';
+        const parts = [];
+        if (data.author) parts.push(data.author);
+        if (data.date) parts.push(data.date);
+        if (data.sitename) parts.push(data.sitename);
+
+        parts.forEach((text, i) => {
+            if (i > 0) {
+                const dot = document.createElement('span');
+                dot.textContent = '\u00b7';
+                dot.className = 'text-gray-600';
+                el.articleMeta.appendChild(dot);
+            }
+            const span = document.createElement('span');
+            span.textContent = text;
+            el.articleMeta.appendChild(span);
+        });
+
+        if (data.source_url) {
+            if (parts.length > 0) {
+                const dot = document.createElement('span');
+                dot.textContent = '\u00b7';
+                dot.className = 'text-gray-600';
+                el.articleMeta.appendChild(dot);
+            }
+            const link = document.createElement('a');
+            link.href = data.source_url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = 'View Original';
+            link.className = 'text-accent hover:text-accent-hover transition-colors';
+            el.articleMeta.appendChild(link);
+        }
+
+        // Body
+        el.articleText.innerHTML = textToHtml(data.text);
+    }
+
+    const FULL_VIEW_STYLES = `
+    body {
+        max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem;
+        font-family: Georgia, 'Times New Roman', serif;
+        font-size: 1.125rem; line-height: 1.85;
+        color: #d1d5db; background: #0f0f1a;
+    }
+    .injected-title {
+        font-size: 2rem; font-weight: 700; color: #fff;
+        line-height: 1.25; margin: 0 0 1.5em 0; padding-bottom: 1em;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+    img { max-width: 100%; height: auto; border-radius: 8px; margin: 1.5em 0; }
+    a { color: #e94560; }
+    h1, h2, h3, h4 { color: #fff; line-height: 1.3; margin-top: 1.5em; }
+    h1 { font-size: 1.8rem; }
+    h2 { font-size: 1.4rem; }
+    p { margin-bottom: 1.25em; }
+    blockquote {
+        border-left: 3px solid #e94560; margin: 1.5em 0;
+        padding: 0.5em 1em; color: #9ca3af; font-style: italic;
+    }
+    figure { margin: 1.5em 0; }
+    figcaption { color: #6b7280; font-size: 0.875rem; margin-top: 0.5em; text-align: center; }
+    table { width: 100%; border-collapse: collapse; margin: 1.5em 0; }
+    th, td { border: 1px solid #374151; padding: 0.5em 0.75em; text-align: left; }
+    th { background: #1a1a2e; color: #fff; }
+    pre, code { background: #1a1a2e; border-radius: 4px; padding: 0.2em 0.4em; font-size: 0.9em; }
+    pre { padding: 1em; overflow-x: auto; }
+    ul, ol { padding-left: 1.5em; margin-bottom: 1.25em; }
+    li { margin-bottom: 0.5em; }`;
+
+    function buildFullViewHtml(cleanHtml, title) {
+        const titleHtml = title ? `<h1 class="injected-title">${escapeHtml(title)}</h1>` : '';
+        return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><style>${FULL_VIEW_STYLES}</style></head>
+<body>${titleHtml}${cleanHtml}</body></html>`;
+    }
+
+    function renderFullView(html) {
+        el.fullViewFrame.srcdoc = html;
+        el.fullViewFrame.onload = () => {
+            try {
+                const h = el.fullViewFrame.contentDocument.body.scrollHeight;
+                el.fullViewFrame.style.height = (h + 40) + 'px';
+            } catch (e) {
+                el.fullViewFrame.style.height = '80vh';
+            }
+        };
+    }
+
+    function switchView(view) {
+        state.currentView = view;
+        if (view === 'clean') {
+            show(el.cleanView);
+            hide(el.fullView);
+            el.toggleClean.classList.add('active');
+            el.toggleClean.classList.remove('text-gray-400');
+            el.toggleFull.classList.remove('active');
+            el.toggleFull.classList.add('text-gray-400');
+            el.toggleIndicator.style.transform = 'translateX(0)';
+        } else {
+            hide(el.cleanView);
+            show(el.fullView);
+            el.toggleFull.classList.add('active');
+            el.toggleFull.classList.remove('text-gray-400');
+            el.toggleClean.classList.remove('active');
+            el.toggleClean.classList.add('text-gray-400');
+            el.toggleIndicator.style.transform = 'translateX(100%)';
+        }
+    }
+
+    // === MAIN FLOW ===
+    async function handleSubmit() {
+        const url = el.urlInput.value.trim();
+        if (!url || state.loading) return;
+
+        // Reset
+        state.translatedText = null;
+        state.translatedTitle = null;
+        state.cleanHtmlTranslated = null;
+        state.cleanHtmlOriginal = null;
+        state.isTranslated = false;
+        el.translateLabel.textContent = 'Translate to English';
+        hide(el.strategyBadge);
+
+        showLoading('Fetching article...');
+
+        try {
+            const fetchResult = await apiFetch(url);
+            state.rawHtml = fetchResult.html;
+            state.cleanHtml = fetchResult.clean_html;
+
+            // Show strategy badge
+            const strategyNames = {
+                googlebot: 'Fetched via Googlebot',
+                google_chrome: 'Fetched via Google referrer',
+                facebook_referrer: 'Fetched via Facebook referrer',
+                twitter_referrer: 'Fetched via Twitter referrer',
+                bingbot: 'Fetched via Bingbot',
+            };
+            el.strategyText.textContent = strategyNames[fetchResult.strategy_used] || fetchResult.strategy_used;
+            show(el.strategyBadge);
+
+            showLoading('Extracting content...');
+            const extractResult = await apiExtract(state.rawHtml, url);
+            state.extractedData = extractResult;
+
+            hideLoading();
+            renderCleanView(state.extractedData);
+
+            // Build full view HTML with title from extraction
+            const title = state.extractedData.title || '';
+            state.cleanHtmlOriginal = buildFullViewHtml(state.cleanHtml, title);
+            state.cleanHtmlTranslated = null;
+            renderFullView(state.cleanHtmlOriginal);
+
+            show(el.results);
+            switchView('clean');
+
+        } catch (err) {
+            showError(err.message);
+        }
+    }
+
+    function applyTranslationToViews() {
+        // Update clean view
+        if (state.isTranslated && state.translatedText) {
+            el.articleText.innerHTML = textToHtml(state.translatedText);
+            el.articleTitle.textContent = state.translatedTitle || state.extractedData.title || 'Untitled Article';
+        } else {
+            el.articleText.innerHTML = textToHtml(state.extractedData.text);
+            el.articleTitle.textContent = state.extractedData.title || 'Untitled Article';
+        }
+
+        // Update full view
+        if (state.isTranslated && state.cleanHtmlTranslated) {
+            renderFullView(state.cleanHtmlTranslated);
+        } else if (state.cleanHtmlOriginal) {
+            renderFullView(state.cleanHtmlOriginal);
+        }
+    }
+
+    async function handleTranslate() {
+        if (state.isTranslated) {
+            // Toggle back to original
+            state.isTranslated = false;
+            el.translateLabel.textContent = 'Translate to English';
+            applyTranslationToViews();
+            return;
+        }
+
+        if (state.translatedText) {
+            // Already translated, just swap
+            state.isTranslated = true;
+            el.translateLabel.textContent = 'Show Original';
+            applyTranslationToViews();
+            return;
+        }
+
+        // First time translating — need to translate both clean text and full-view HTML
+        el.translateBtn.disabled = true;
+        el.translateLabel.innerHTML = '<span class="spinner" style="width:14px;height:14px;border-width:2px;vertical-align:middle;margin-right:6px;"></span>Translating...';
+
+        try {
+            // Translate title
+            if (state.extractedData.title) {
+                const titleResult = await apiTranslate(state.extractedData.title);
+                state.translatedTitle = titleResult.translated_text;
+            }
+
+            // Translate clean text
+            const result = await apiTranslate(state.extractedData.text);
+            state.translatedText = result.translated_text;
+
+            // Translate the full-view text content
+            try {
+                const fullDoc = el.fullViewFrame.contentDocument;
+                const bodyText = fullDoc.body.innerText || '';
+                if (bodyText.trim().length > 0) {
+                    const fullResult = await apiTranslate(bodyText);
+                    const translatedParas = fullResult.translated_text
+                        .split(/\n\n+/)
+                        .filter(p => p.trim())
+                        .map(p => `<p>${escapeHtml(p.trim())}</p>`)
+                        .join('');
+                    state.cleanHtmlTranslated = buildFullViewHtml(translatedParas, state.translatedTitle || '');
+                }
+            } catch (fullViewErr) {
+                console.warn('Full view translation fallback:', fullViewErr);
+            }
+
+            state.isTranslated = true;
+            el.translateLabel.textContent = 'Show Original';
+            applyTranslationToViews();
+        } catch (err) {
+            showError('Translation failed: ' + err.message);
+        } finally {
+            el.translateBtn.disabled = false;
+        }
+    }
+
+    // === EVENT LISTENERS ===
+    el.fetchBtn.addEventListener('click', handleSubmit);
+    el.urlInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') handleSubmit();
+    });
+    el.toggleClean.addEventListener('click', () => switchView('clean'));
+    el.toggleFull.addEventListener('click', () => switchView('full'));
+    el.translateBtn.addEventListener('click', handleTranslate);
+    el.errorClose.addEventListener('click', () => hide(el.error));
+
+    // Auto-focus input
+    el.urlInput.focus();
+})();
+</script>
+</body>
+</html>

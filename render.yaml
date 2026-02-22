@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: article-reader
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    autoDeploy: true

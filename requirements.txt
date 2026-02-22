@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+trafilatura
+readability-lxml
+deep-translator
+lxml
