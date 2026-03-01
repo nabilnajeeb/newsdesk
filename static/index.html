@@ -519,6 +519,8 @@
                 facebook_referrer: 'Fetched via Facebook referrer',
                 twitter_referrer: 'Fetched via Twitter referrer',
                 bingbot: 'Fetched via Bingbot',
+                google_cache: 'Fetched via Google Cache',
+                wayback_machine: 'Fetched via Wayback Machine',
             };
             el.strategyText.textContent = strategyNames[fetchResult.strategy_used] || fetchResult.strategy_used;
             show(el.strategyBadge);

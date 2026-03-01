@@ -110,13 +110,14 @@ HEADER_STRATEGIES = [
 # ---------------------------------------------------------------------------
 
 async def fetch_with_bypass(url: str) -> tuple[str, int, str, str]:
-    """Try each header strategy until one returns HTTP 200 with substantial content."""
+    """Try each header strategy, then cached/archived versions as fallbacks."""
     last_error = None
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(30.0),
         verify=False,
     ) as client:
+        # --- Phase 1: direct fetch with header rotation ---
         for strategy in HEADER_STRATEGIES:
             try:
                 response = await client.get(url, headers=strategy["headers"])
@@ -131,6 +132,39 @@ async def fetch_with_bypass(url: str) -> tuple[str, int, str, str]:
             except httpx.HTTPError as e:
                 last_error = str(e)
                 continue
+
+        # --- Phase 2: cached / archived fallbacks ---
+        chrome_headers = HEADER_STRATEGIES[1]["headers"]
+
+        # Google Cache
+        try:
+            cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
+            response = await client.get(cache_url, headers=chrome_headers)
+            if response.status_code == 200 and len(response.text) > 1000:
+                return (response.text, 200, url, "google_cache")
+            last_error = f"Google Cache: Status {response.status_code}"
+        except httpx.HTTPError as e:
+            last_error = f"Google Cache error: {e}"
+
+        # Wayback Machine (latest snapshot)
+        try:
+            wb_api = f"https://archive.org/wayback/available?url={url}"
+            wb_resp = await client.get(wb_api, timeout=10)
+            if wb_resp.status_code == 200:
+                wb_data = wb_resp.json()
+                snapshot_url = (wb_data.get("archived_snapshots", {})
+                                      .get("closest", {})
+                                      .get("url"))
+                if snapshot_url:
+                    snap_resp = await client.get(snapshot_url, headers=chrome_headers)
+                    if snap_resp.status_code == 200 and len(snap_resp.text) > 1000:
+                        return (snap_resp.text, 200, url, "wayback_machine")
+                    last_error = f"Wayback snapshot: Status {snap_resp.status_code}"
+                else:
+                    last_error = "Wayback Machine: no snapshot found"
+        except (httpx.HTTPError, Exception) as e:
+            last_error = f"Wayback Machine error: {e}"
+
     raise HTTPException(status_code=502, detail=f"All fetch strategies failed. Last error: {last_error}")
 
 
@@ -260,17 +294,34 @@ async def api_extract(req: ExtractRequest):
     if result is None:
         raise HTTPException(status_code=422, detail="Could not extract article content")
 
-    raw_text = result.get("text", "")
+    # trafilatura v1.x returns a dict; v2.x returns a Document object — handle both
+    if isinstance(result, dict):
+        raw_text    = result.get("text", "") or ""
+        title       = result.get("title")
+        author      = result.get("author")
+        date        = result.get("date")
+        description = result.get("description")
+        sitename    = result.get("sitename")
+        language    = result.get("language")
+    else:
+        raw_text    = getattr(result, "text", "") or ""
+        title       = getattr(result, "title", None)
+        author      = getattr(result, "author", None)
+        date        = getattr(result, "date", None)
+        description = getattr(result, "description", None)
+        sitename    = getattr(result, "sitename", None)
+        language    = getattr(result, "language", None)
+
     cleaned_text = _clean_extracted_text(raw_text)
 
     return ExtractResponse(
-        title=result.get("title"),
-        author=result.get("author"),
-        date=result.get("date"),
+        title=title,
+        author=author,
+        date=date,
         text=cleaned_text,
-        description=result.get("description"),
-        sitename=result.get("sitename"),
-        language=result.get("language"),
+        description=description,
+        sitename=sitename,
+        language=language,
         source_url=req.url,
     )
 
