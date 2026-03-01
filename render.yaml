@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: article-reader
+    name: newsdesk
     runtime: docker
     plan: free
     healthCheckPath: /
