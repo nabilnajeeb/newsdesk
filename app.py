@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Optional
 import httpx
 import trafilatura
 import uvicorn
+from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -198,6 +200,68 @@ def sanitize_html_for_display(raw_html: str) -> str:
     return tostring(cleaned, encoding="unicode")
 
 
+def _extract_meta_fallback(html: str) -> dict:
+    """Extract title, author, date from Open Graph / meta tags / JSON-LD as fallback."""
+    result = {"title": None, "author": None, "date": None, "sitename": None}
+    try:
+        soup = BeautifulSoup(html, "lxml")
+
+        def meta(prop, attr="property"):
+            tag = soup.find("meta", {attr: prop})
+            return tag["content"].strip() if tag and tag.get("content") else None
+
+        # Title: og:title > twitter:title > <title> tag
+        result["title"] = (
+            meta("og:title")
+            or meta("twitter:title")
+            or meta("title", attr="name")
+            or (soup.title.get_text(strip=True) if soup.title else None)
+        )
+
+        # Site name
+        result["sitename"] = meta("og:site_name")
+
+        # Author: article:author > meta author > JSON-LD
+        result["author"] = meta("article:author") or meta("author", attr="name")
+
+        # Date: article:published_time > datePublished > og:updated_time
+        result["date"] = (
+            meta("article:published_time")
+            or meta("article:modified_time")
+            or meta("og:updated_time")
+            or meta("date", attr="name")
+            or meta("pubdate", attr="name")
+        )
+        # Trim date to just YYYY-MM-DD if it's an ISO string
+        if result["date"] and "T" in result["date"]:
+            result["date"] = result["date"].split("T")[0]
+
+        # JSON-LD fallback for author and date
+        if not result["author"] or not result["date"]:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = json.loads(script.string or "")
+                    if isinstance(data, list):
+                        data = data[0]
+                    if not result["author"]:
+                        author_field = data.get("author") or data.get("creator")
+                        if isinstance(author_field, dict):
+                            result["author"] = author_field.get("name")
+                        elif isinstance(author_field, list) and author_field:
+                            result["author"] = author_field[0].get("name") if isinstance(author_field[0], dict) else str(author_field[0])
+                        elif isinstance(author_field, str):
+                            result["author"] = author_field
+                    if not result["date"]:
+                        raw_date = data.get("datePublished") or data.get("dateCreated")
+                        if raw_date:
+                            result["date"] = raw_date.split("T")[0] if "T" in raw_date else raw_date
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return result
+
+
 def _clean_extracted_text(text: str) -> str:
     """Remove URLs, image references, markdown link/image syntax, and other artifacts."""
     # Remove markdown image syntax: ![alt](url)
@@ -311,6 +375,14 @@ async def api_extract(req: ExtractRequest):
         description = getattr(result, "description", None)
         sitename    = getattr(result, "sitename", None)
         language    = getattr(result, "language", None)
+
+    # Fill missing metadata from Open Graph / meta tags / JSON-LD
+    if not all([title, author, date, sitename]):
+        meta = _extract_meta_fallback(req.html)
+        title    = title    or meta.get("title")
+        author   = author   or meta.get("author")
+        date     = date     or meta.get("date")
+        sitename = sitename or meta.get("sitename")
 
     cleaned_text = _clean_extracted_text(raw_text)
 
