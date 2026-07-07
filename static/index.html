@@ -167,6 +167,16 @@
         }
         .chip:hover { background: rgba(139,92,246,0.18); color:#fff; border-color: rgba(167,139,250,0.4); }
 
+        .ext-reader {
+            display:inline-flex; align-items:center; gap:.4rem;
+            padding:.42rem .8rem; border-radius:.65rem; font-size:.8rem; font-weight:600;
+            background: rgba(139,92,246,0.14); border:1px solid rgba(167,139,250,0.32);
+            color:#c9b8fb; cursor:pointer; transition:all .18s ease; white-space:nowrap;
+        }
+        .ext-reader:hover { background: rgba(139,92,246,0.24); color:#fff; border-color: rgba(167,139,250,0.6); transform: translateY(-1px); }
+        .ext-reader:active { transform: translateY(0); }
+        .ext-reader svg { width:13px; height:13px; opacity:.8; }
+
         /* ---------- Toggle ---------- */
         .seg { position: relative; display: flex; background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.07); border-radius: .8rem; padding: 4px; }
         .seg-ind { position:absolute; top:4px; bottom:4px; border-radius:.6rem; background: linear-gradient(120deg,#8b5cf6,#ec4899); transition: transform .3s cubic-bezier(.4,0,.2,1), width .3s ease; z-index:0; box-shadow: 0 4px 14px -4px rgba(139,92,246,0.7); }
@@ -287,7 +297,8 @@
                 <div class="flex-1">
                     <p class="text-red-300 font-semibold text-sm">Couldn't load this article</p>
                     <p id="error-text" class="text-red-400/70 text-sm mt-1"></p>
-                    <p class="text-red-400/50 text-xs mt-2">Try the original link, or paste a different source.</p>
+                    <p class="text-gray-400 text-xs mt-3 mb-2">Try opening it in one of these readers (they run in your browser, so they often get through where we can't):</p>
+                    <div id="error-readers" class="flex flex-wrap gap-2"></div>
                 </div>
                 <button id="error-close" class="text-red-400/50 hover:text-red-400 transition-colors">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
@@ -349,9 +360,10 @@
             <!-- Partial / paywall notice -->
             <div id="partial-note" class="hidden mb-4 rounded-xl px-4 py-3 flex items-start gap-2.5 text-sm" style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22)">
                 <svg class="w-4 h-4 text-amber-300 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
-                <div class="text-amber-200/90">
+                <div class="text-amber-200/90 flex-1">
                     <span class="font-semibold">Only a preview was recovered.</span>
-                    This source has a hard paywall we couldn't get past. The title and available excerpt are shown — try the <span id="partial-orig-wrap">original link</span> for the full text.
+                    This source has a hard paywall we couldn't get past. Try one of these readers for the full text — they run in your browser, so they often succeed where our server can't:
+                    <div id="partial-readers" class="flex flex-wrap gap-2 mt-2.5"></div>
                 </div>
             </div>
 
@@ -427,6 +439,7 @@
     const READING_WPM = 220;
 
     const state = {
+        currentUrl: null,
         rawHtml: null, cleanHtml: null, readerMode: false,
         cleanHtmlOriginal: null, cleanHtmlTranslated: null,
         extractedData: null,
@@ -441,7 +454,8 @@
     const el = {
         urlInput: $('#url-input'), fetchBtn: $('#fetch-btn'), fetchLabel: $('#fetch-btn-label'),
         loading: $('#loading'), loadingText: $('#loading-text'),
-        error: $('#error'), errorText: $('#error-text'), errorClose: $('#error-close'),
+        error: $('#error'), errorText: $('#error-text'), errorClose: $('#error-close'), errorReaders: $('#error-readers'),
+        partialReaders: $('#partial-readers'),
         results: $('#results'), cleanView: $('#clean-view'), fullView: $('#full-view'),
         fullFrame: $('#full-view-frame'), readerNote: $('#reader-mode-note'), partialNote: $('#partial-note'),
         title: $('#article-title'), meta: $('#article-meta'), text: $('#article-text'),
@@ -486,6 +500,42 @@
         setTimeout(() => { t.style.transition = 'opacity .3s, transform .3s'; t.style.opacity = '0'; t.style.transform = 'translateY(8px)'; setTimeout(() => t.remove(), 300); }, 2200);
     }
 
+    // ---------- External readers (open in the user's own browser) ----------
+    const EXT_ICON = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"/></svg>';
+    const EXTERNAL_READERS = [
+        { label: 'archive.today', build: (u) => 'https://archive.ph/newest/' + u },
+        { label: 'RemovePaywalls', build: (u) => 'https://www.removepaywalls.com/' + u },
+        // Periscope has no prefill param — open it and copy the URL for the user to paste
+        { label: 'Periscope', build: () => 'https://periscope.corsfix.com/', copyFirst: true },
+    ];
+    function renderExternalReaders(container, url) {
+        if (!container || !url) return;
+        container.innerHTML = '';
+        EXTERNAL_READERS.forEach(r => {
+            const b = document.createElement('button');
+            b.className = 'ext-reader';
+            b.innerHTML = `<span>${r.label}</span>${EXT_ICON}`;
+            b.addEventListener('click', () => {
+                window.open(r.build(url), '_blank', 'noopener');   // keep inside the user gesture
+                if (r.copyFirst) {
+                    navigator.clipboard?.writeText(url)
+                        .then(() => toast('Link copied — paste it into ' + r.label))
+                        .catch(() => {});
+                }
+            });
+            container.appendChild(b);
+        });
+        // Always offer the original link too
+        const orig = document.createElement('a');
+        orig.href = url; orig.target = '_blank'; orig.rel = 'noopener noreferrer';
+        orig.className = 'ext-reader';
+        orig.style.background = 'rgba(255,255,255,0.05)';
+        orig.style.borderColor = 'rgba(255,255,255,0.12)';
+        orig.style.color = '#b8bcc9';
+        orig.innerHTML = `<span>Original</span>${EXT_ICON}`;
+        container.appendChild(orig);
+    }
+
     // ---------- API ----------
     async function api(path, body, timeoutMs = 90000) {
         const ctrl = new AbortController();
@@ -513,7 +563,12 @@
     // ---------- Loading / error ----------
     function showLoading(msg) { state.loading = true; el.loadingText.textContent = msg; show(el.loading); hide(el.error); hide(el.results); hide(el.emptyHint); el.fetchBtn.disabled = true; el.fetchLabel.textContent = 'Reading…'; }
     function hideLoading() { state.loading = false; hide(el.loading); el.fetchBtn.disabled = false; el.fetchLabel.textContent = 'Read'; }
-    function showError(msg) { hideLoading(); el.errorText.textContent = msg; show(el.error); }
+    function showError(msg) {
+        hideLoading();
+        el.errorText.textContent = msg;
+        renderExternalReaders(el.errorReaders, state.currentUrl);
+        show(el.error);
+    }
 
     // ---------- Reader theme + font ----------
     function applyReaderTheme() {
@@ -639,6 +694,7 @@
         if (!url || state.loading) return;
         if (!/^https?:\/\//i.test(url)) { url = 'https://' + url; }
         el.urlInput.value = url;
+        state.currentUrl = url;
         stopTTS();
 
         state.translatedText = state.translatedTitle = state.cleanHtmlTranslated = state.translatedFullInner = null;
@@ -662,6 +718,7 @@
             renderFullView(state.cleanHtmlOriginal);
             el.readerNote.classList.toggle('hidden', !state.readerMode);
             el.partialNote.classList.toggle('hidden', !f.partial);
+            if (f.partial) renderExternalReaders(el.partialReaders, url);
 
             show(el.results);
             switchView('clean');
