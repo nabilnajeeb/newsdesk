@@ -5,3 +5,5 @@ trafilatura
 readability-lxml
 deep-translator
 lxml
+beautifulsoup4
+py3langid
