@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NewsDesk — Read anything</title>
-    <meta name="description" content="Paste a link. Read anything. Bypass paywalls, get clean reader mode, translate to English.">
+    <title>NewsDesk — A calmer way to read</title>
+    <meta name="description" content="Turn public articles and text you can access into a clean reader view, then translate, listen, copy, or export.">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -242,7 +242,7 @@
                     <span class="text-white">News</span><span class="bg-gradient-to-r from-accent to-accent-pink bg-clip-text text-transparent">Desk</span>
                 </h1>
             </div>
-            <p class="text-gray-500 mt-2.5 text-sm">Paste a link. Read anything — paywalls bypassed, cleaned, translated.</p>
+            <p class="text-gray-500 mt-2.5 text-sm">Clean up public articles, translate them, listen, and save.</p>
         </header>
 
         <!-- URL Input -->
@@ -297,7 +297,7 @@
                 <div class="flex-1">
                     <p class="text-red-300 font-semibold text-sm">Couldn't load this article</p>
                     <p id="error-text" class="text-red-400/70 text-sm mt-1"></p>
-                    <p class="text-gray-400 text-xs mt-3 mb-2">Try opening it in one of these readers (they run in your browser, so they often get through where we can't):</p>
+                    <p class="text-gray-400 text-xs mt-3 mb-2">Open the publisher page, copy the link, or paste text you are authorized to read:</p>
                     <div id="error-readers" class="flex flex-wrap gap-2"></div>
                 </div>
                 <button id="error-close" class="text-red-400/50 hover:text-red-400 transition-colors">
@@ -361,8 +361,8 @@
             <div id="partial-note" class="hidden mb-4 rounded-xl px-4 py-3 flex items-start gap-2.5 text-sm" style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22)">
                 <svg class="w-4 h-4 text-amber-300 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
                 <div class="text-amber-200/90 flex-1">
-                    <span class="font-semibold">Only a preview was recovered.</span>
-                    This source has a hard paywall we couldn't get past. Try one of these readers for the full text — they run in your browser, so they often succeed where our server can't:
+                    <span class="font-semibold">Publisher preview loaded.</span>
+                    <span id="partial-message">The full article requires publisher access. You can still use the public metadata and preview, or paste text from your authorized session.</span>
                     <div id="partial-readers" class="flex flex-wrap gap-2 mt-2.5"></div>
                 </div>
             </div>
@@ -400,7 +400,7 @@
 
         <!-- Empty-state hint -->
         <div id="empty-hint" class="text-center mt-16 fade-up d3">
-            <p class="text-gray-600 text-sm mb-4">Try a paywalled or foreign-language article</p>
+            <p class="text-gray-600 text-sm mb-4">Try a public or foreign-language article</p>
             <div class="flex flex-wrap justify-center gap-2 max-w-xl mx-auto">
                 <button class="chip" data-url="https://www.lemonde.fr/">Le Monde 🇫🇷</button>
                 <button class="chip" data-url="https://www.spiegel.de/">Der Spiegel 🇩🇪</button>
@@ -431,6 +431,28 @@
         </div>
     </div>
 
+    <!-- Authorized text import modal -->
+    <div id="paste-modal" class="hidden fixed inset-0 z-70 grid place-items-center p-4">
+        <div class="modal-backdrop absolute inset-0" id="paste-backdrop"></div>
+        <div class="glass-strong relative rounded-2xl p-6 w-full max-w-2xl shadow-2xl" style="animation:popIn .25s ease both">
+            <div class="flex items-start justify-between gap-4 mb-4">
+                <div>
+                    <h3 class="text-white font-semibold">Paste article text</h3>
+                    <p class="text-gray-500 text-xs mt-1">Use text from a publisher session or document you are authorized to access.</p>
+                </div>
+                <button id="paste-close" class="text-gray-500 hover:text-white" aria-label="Close"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg></button>
+            </div>
+            <label class="block text-xs font-medium text-gray-400 mb-1.5" for="paste-title">Title</label>
+            <input id="paste-title" type="text" class="w-full bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-violet-400/60 mb-4" placeholder="Article title">
+            <label class="block text-xs font-medium text-gray-400 mb-1.5" for="paste-text">Article text</label>
+            <textarea id="paste-text" rows="12" class="w-full resize-y bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-gray-200 outline-none focus:border-violet-400/60 leading-relaxed" placeholder="Paste the article body here…"></textarea>
+            <div class="flex justify-end gap-2 mt-4">
+                <button id="paste-cancel" class="tool">Cancel</button>
+                <button id="paste-use" class="btn-primary text-white font-semibold px-5 py-2.5 rounded-xl text-sm">Use in NewsDesk</button>
+            </div>
+        </div>
+    </div>
+
     <div id="toast-wrap"></div>
 
 <script>
@@ -455,7 +477,7 @@
         urlInput: $('#url-input'), fetchBtn: $('#fetch-btn'), fetchLabel: $('#fetch-btn-label'),
         loading: $('#loading'), loadingText: $('#loading-text'),
         error: $('#error'), errorText: $('#error-text'), errorClose: $('#error-close'), errorReaders: $('#error-readers'),
-        partialReaders: $('#partial-readers'),
+        partialReaders: $('#partial-readers'), partialMessage: $('#partial-message'),
         results: $('#results'), cleanView: $('#clean-view'), fullView: $('#full-view'),
         fullFrame: $('#full-view-frame'), readerNote: $('#reader-mode-note'), partialNote: $('#partial-note'),
         title: $('#article-title'), meta: $('#article-meta'), text: $('#article-text'),
@@ -467,6 +489,8 @@
         fontDec: $('#font-dec'), fontInc: $('#font-inc'),
         themeSeg: $('#theme-seg'),
         help: $('#help-modal'), helpBtn: $('#help-btn'), helpClose: $('#help-close'), helpBackdrop: $('#help-backdrop'),
+        pasteModal: $('#paste-modal'), pasteBackdrop: $('#paste-backdrop'), pasteClose: $('#paste-close'),
+        pasteCancel: $('#paste-cancel'), pasteUse: $('#paste-use'), pasteTitle: $('#paste-title'), pasteText: $('#paste-text'),
         history: $('#history'), historyChips: $('#history-chips'), historyClear: $('#history-clear'),
         emptyHint: $('#empty-hint'),
         progress: $('#progress-bar'), toast: $('#toast-wrap'),
@@ -500,40 +524,39 @@
         setTimeout(() => { t.style.transition = 'opacity .3s, transform .3s'; t.style.opacity = '0'; t.style.transform = 'translateY(8px)'; setTimeout(() => t.remove(), 300); }, 2200);
     }
 
-    // ---------- External readers (open in the user's own browser) ----------
+    // ---------- Restricted / failed article recovery ----------
     const EXT_ICON = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"/></svg>';
-    const EXTERNAL_READERS = [
-        { label: 'archive.today', build: (u) => 'https://archive.ph/newest/' + u },
-        { label: 'RemovePaywalls', build: (u) => 'https://www.removepaywalls.com/' + u },
-        // Periscope has no prefill param — open it and copy the URL for the user to paste
-        { label: 'Periscope', build: () => 'https://periscope.corsfix.com/', copyFirst: true },
-    ];
-    function renderExternalReaders(container, url) {
+    function openPasteModal() {
+        el.pasteTitle.value = state.extractedData?.title || '';
+        el.pasteText.value = '';
+        show(el.pasteModal);
+        setTimeout(() => (el.pasteTitle.value ? el.pasteText : el.pasteTitle).focus(), 0);
+    }
+    function closePasteModal() { hide(el.pasteModal); }
+    function renderRecoveryActions(container, url) {
         if (!container || !url) return;
         container.innerHTML = '';
-        EXTERNAL_READERS.forEach(r => {
-            const b = document.createElement('button');
-            b.className = 'ext-reader';
-            b.innerHTML = `<span>${r.label}</span>${EXT_ICON}`;
-            b.addEventListener('click', () => {
-                window.open(r.build(url), '_blank', 'noopener');   // keep inside the user gesture
-                if (r.copyFirst) {
-                    navigator.clipboard?.writeText(url)
-                        .then(() => toast('Link copied — paste it into ' + r.label))
-                        .catch(() => {});
-                }
-            });
-            container.appendChild(b);
-        });
-        // Always offer the original link too
+
         const orig = document.createElement('a');
         orig.href = url; orig.target = '_blank'; orig.rel = 'noopener noreferrer';
         orig.className = 'ext-reader';
-        orig.style.background = 'rgba(255,255,255,0.05)';
-        orig.style.borderColor = 'rgba(255,255,255,0.12)';
-        orig.style.color = '#b8bcc9';
-        orig.innerHTML = `<span>Original</span>${EXT_ICON}`;
+        orig.innerHTML = `<span>Open publisher</span>${EXT_ICON}`;
         container.appendChild(orig);
+
+        const copy = document.createElement('button');
+        copy.className = 'ext-reader';
+        copy.textContent = 'Copy link';
+        copy.addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(url); toast('Link copied'); }
+            catch { toast('Copy failed', 'error'); }
+        });
+        container.appendChild(copy);
+
+        const paste = document.createElement('button');
+        paste.className = 'ext-reader';
+        paste.textContent = 'Paste article text';
+        paste.addEventListener('click', openPasteModal);
+        container.appendChild(paste);
     }
 
     // ---------- API ----------
@@ -566,7 +589,7 @@
     function showError(msg) {
         hideLoading();
         el.errorText.textContent = msg;
-        renderExternalReaders(el.errorReaders, state.currentUrl);
+        renderRecoveryActions(el.errorReaders, state.currentUrl);
         show(el.error);
     }
 
@@ -596,7 +619,7 @@
         items.forEach(h => el.metaChips.appendChild(chip(h)));
 
         if (strategy) {
-            const label = { googlebot:'Googlebot', google_chrome:'Google referrer', facebook_referrer:'Facebook referrer', twitter_referrer:'Twitter referrer', bingbot:'Bingbot', archive_today:'archive.today', jina_reader:'Reader proxy', wayback_machine:'Wayback Machine' }[strategy] || strategy;
+            const label = { direct:'Publisher page', amp:'Publisher AMP page', jina_reader:'Public reader fallback', pasted_text:'Pasted text' }[strategy] || strategy;
             const s = document.createElement('span');
             s.className = 'chip !cursor-default flex items-center gap-1.5';
             s.style.background = 'rgba(16,185,129,0.12)'; s.style.borderColor = 'rgba(16,185,129,0.25)'; s.style.color = '#6ee7b7';
@@ -695,6 +718,7 @@
         if (!/^https?:\/\//i.test(url)) { url = 'https://' + url; }
         el.urlInput.value = url;
         state.currentUrl = url;
+        state.extractedData = null;
         stopTTS();
 
         state.translatedText = state.translatedTitle = state.cleanHtmlTranslated = state.translatedFullInner = null;
@@ -718,7 +742,11 @@
             renderFullView(state.cleanHtmlOriginal);
             el.readerNote.classList.toggle('hidden', !state.readerMode);
             el.partialNote.classList.toggle('hidden', !f.partial);
-            if (f.partial) renderExternalReaders(el.partialReaders, url);
+            if (f.partial) {
+                el.partialMessage.textContent = f.notice || 'The full article requires publisher access. You can still use the public metadata and preview, or paste text from your authorized session.';
+                renderRecoveryActions(el.partialReaders, url);
+            }
+            if (!f.partial && f.notice) toast(f.notice);
 
             show(el.results);
             switchView('clean');
@@ -728,6 +756,46 @@
         } catch (err) {
             showError(err.message);
         }
+    }
+
+    function usePastedArticle() {
+        const body = el.pasteText.value.trim();
+        if (body.length < 40) { toast('Paste a little more article text', 'error'); return; }
+
+        const previous = state.extractedData || {};
+        const title = el.pasteTitle.value.trim() || previous.title || 'Pasted article';
+        const wordCount = body.split(/\s+/).filter(Boolean).length;
+        const data = {
+            title,
+            author: previous.author || null,
+            date: previous.date || null,
+            text: body,
+            description: previous.description || null,
+            sitename: previous.sitename || domain(state.currentUrl || ''),
+            language: previous.language || null,
+            language_name: previous.language_name || null,
+            word_count: wordCount,
+            reading_minutes: Math.max(1, Math.round(wordCount / READING_WPM)),
+            source_url: state.currentUrl,
+        };
+
+        state.extractedData = data;
+        state.cleanHtml = `<article>${textToHtml(body)}</article>`;
+        state.rawHtml = state.cleanHtml;
+        state.readerMode = false;
+        state.translatedText = state.translatedTitle = state.cleanHtmlTranslated = state.translatedFullInner = null;
+        state.isTranslated = false;
+        el.translateLabel.textContent = 'Translate';
+        el.translateBtn.classList.remove('active');
+
+        renderMetaChips(data, 'pasted_text');
+        renderCleanView(data);
+        state.cleanHtmlOriginal = buildFullHtml(state.cleanHtml, title);
+        renderFullView(state.cleanHtmlOriginal);
+        hide(el.error); hide(el.partialNote); hide(el.readerNote); closePasteModal();
+        show(el.results); switchView('clean'); requestAnimationFrame(initSegIndicator);
+        saveHistory({ url: state.currentUrl, title, sitename: data.sitename });
+        toast('Pasted article ready');
     }
 
     // ---------- Translation ----------
@@ -881,6 +949,10 @@
     el.helpBtn.addEventListener('click', () => show(el.help));
     el.helpClose.addEventListener('click', () => hide(el.help));
     el.helpBackdrop.addEventListener('click', () => hide(el.help));
+    el.pasteUse.addEventListener('click', usePastedArticle);
+    el.pasteClose.addEventListener('click', closePasteModal);
+    el.pasteCancel.addEventListener('click', closePasteModal);
+    el.pasteBackdrop.addEventListener('click', closePasteModal);
     el.historyClear.addEventListener('click', () => { localStorage.removeItem('nd_history'); renderHistory(); });
 
     document.querySelectorAll('#empty-hint .chip').forEach(c => c.addEventListener('click', () => { el.urlInput.value = c.dataset.url; el.urlInput.focus(); }));
@@ -891,13 +963,13 @@
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
-            if (e.key === 'Escape') e.target.blur();
+            if (e.key === 'Escape') { e.target.blur(); closePasteModal(); }
             return;
         }
         if (e.metaKey || e.ctrlKey || e.altKey) return;
         const k = e.key.toLowerCase();
         if (k === '/') { e.preventDefault(); el.urlInput.focus(); }
-        else if (k === 'escape') { hide(el.help); }
+        else if (k === 'escape') { hide(el.help); closePasteModal(); }
         else if (!el.results.classList.contains('hidden')) {
             if (k === 'v') switchView(state.currentView === 'clean' ? 'full' : 'clean');
             else if (k === 't') handleTranslate();

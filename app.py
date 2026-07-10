@@ -1,9 +1,13 @@
 import asyncio
+import html as html_lib
+import ipaddress
 import json
 import os
 import re
+import socket
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import trafilatura
@@ -33,6 +37,8 @@ class FetchResponse(BaseModel):
     strategy_used: str
     reader_mode: bool = False   # True when content came from a reader proxy (limited full view)
     partial: bool = False       # True when the recovered content looks like a paywall teaser
+    access_status: str = "public"
+    notice: Optional[str] = None
 
 class ExtractRequest(BaseModel):
     html: str
@@ -79,10 +85,10 @@ LANG_NAMES = {
     "lv": "Latvian", "et": "Estonian",
 }
 
-# A "good" direct fetch yields at least this many characters of real article
-# text. Below this we treat the page as a soft paywall / teaser and keep
-# trying archive + reader fallbacks to find a fuller copy.
-GOOD_TEXT_THRESHOLD = 1800
+# A public article below this threshold gets one additional, non-restricted
+# reader fallback. Restricted previews never go through that fallback.
+GOOD_TEXT_THRESHOLD = 1200
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -97,104 +103,158 @@ _SEC_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-HEADER_STRATEGIES = [
-    {
-        "name": "googlebot",
-        "headers": {
-            "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-            "Referer": "https://www.google.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "From": "googlebot(at)googlebot.com",
-        },
-    },
-    {
-        "name": "google_chrome",
-        "headers": {
-            "User-Agent": _BROWSER_UA,
-            "Referer": "https://www.google.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            **_SEC_HEADERS,
-        },
-    },
-    {
-        "name": "facebook_referrer",
-        "headers": {
-            "User-Agent": _BROWSER_UA,
-            "Referer": "https://www.facebook.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            **_SEC_HEADERS,
-        },
-    },
-    {
-        "name": "twitter_referrer",
-        "headers": {
-            "User-Agent": _BROWSER_UA,
-            "Referer": "https://t.co/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            **_SEC_HEADERS,
-        },
-    },
-    {
-        "name": "bingbot",
-        "headers": {
-            "User-Agent": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    },
-]
-
-STRATEGY_LABELS = {
-    "googlebot": "Googlebot",
-    "google_chrome": "Google referrer",
-    "facebook_referrer": "Facebook referrer",
-    "twitter_referrer": "Twitter referrer",
-    "bingbot": "Bingbot",
-    "archive_today": "archive.today",
-    "jina_reader": "Reader proxy",
-    "wayback_machine": "Wayback Machine",
+REQUEST_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    **_SEC_HEADERS,
 }
 
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
-def _quick_text_len(html: str) -> int:
-    """Return the length of the main article text trafilatura can pull out."""
-    if not html:
-        return 0
-    try:
-        txt = trafilatura.extract(
-            html, include_comments=False, include_tables=False, favor_recall=True
-        )
-        return len(txt) if txt else 0
-    except Exception:
-        return 0
 
+STRONG_RESTRICTION_MARKERS = (
+    "subscribe to unlock", "subscribe to read", "create an account to read",
+    "this article is for subscribers", "sign in to read",
+    "register to continue", "to continue reading", "unlock this article",
+    "subscription required",
+)
 
-PAYWALL_MARKERS = (
-    "subscribe to unlock", "subscribe to read", "complete digital access",
-    "for full access", "already a subscriber", "unlimited access",
-    "create an account to read", "this article is for subscribers",
-    "sign in to read", "register to continue", "to continue reading",
-    "become a member", "unlock this article",
+SOFT_RESTRICTION_MARKERS = (
+    "complete digital access", "for full access", "already a subscriber",
+    "unlimited access", "become a member",
+)
+
+BLOCK_PAGE_MARKERS = (
+    "verify you are human", "complete the captcha", "captcha challenge",
+    "checking your browser", "just a moment...", "access denied",
+    "request blocked", "cf-chl-", "attention required! | cloudflare",
+)
+
+RESTRICTED_NOTICE = (
+    "The publisher returned a subscriber-only preview. NewsDesk preserved the "
+    "public title and metadata, but it cannot retrieve content your account is "
+    "not authorized to access."
 )
 
 
-def _looks_paywalled(text: str) -> bool:
-    """Heuristic: short body that contains subscribe/paywall language."""
-    if not text:
+def _extract_main_text(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        return trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=False,
+            favor_recall=True,
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _looks_blocked(html: str, extracted_text: str) -> bool:
+    """Reject CAPTCHA and anti-bot pages instead of treating them as articles."""
+    try:
+        visible = BeautifulSoup(html[:250000], "lxml").get_text(" ", strip=True)
+    except Exception:
+        visible = html[:50000]
+    sample = f"{visible[:15000]} {extracted_text[:5000]}".lower()
+    return any(marker in sample for marker in BLOCK_PAGE_MARKERS)
+
+
+def _looks_restricted(html: str, extracted_text: str) -> bool:
+    """Classify a subscriber preview without letting footer copy inflate it."""
+    if re.search(r'"isAccessibleForFree"\s*:\s*false', html[:500000], flags=re.IGNORECASE):
         return True
-    words = len(text.split())
-    if words > 250:
+    try:
+        visible = BeautifulSoup(html[:350000], "lxml").get_text(" ", strip=True)
+    except Exception:
+        visible = html[:80000]
+    sample = f"{extracted_text[:12000]} {visible[:20000]}".lower()
+    strong_hits = sum(marker in sample for marker in STRONG_RESTRICTION_MARKERS)
+    soft_hits = sum(marker in sample for marker in SOFT_RESTRICTION_MARKERS)
+    if strong_hits == 0 and soft_hits == 0:
         return False
-    low = text.lower()
-    return any(m in low for m in PAYWALL_MARKERS)
+    article_words = len(extracted_text.split())
+    return (strong_hits >= 1 and article_words < 1200) or (
+        strong_hits + soft_hits >= 2 and article_words < 800
+    )
+
+
+async def _validate_public_url(url: str) -> str:
+    """Allow only public HTTP(S) destinations and block SSRF targets."""
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid article URL") from exc
+
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Enter a valid http:// or https:// article URL")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="Article URLs cannot contain credentials")
+    if port not in {None, 80, 443}:
+        raise HTTPException(status_code=400, detail="Only standard web ports are supported")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise HTTPException(status_code=400, detail="Local network URLs are not supported")
+
+    try:
+        addresses = await asyncio.to_thread(
+            socket.getaddrinfo,
+            hostname,
+            port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=400, detail="The article host could not be resolved") from exc
+
+    for address in {item[4][0] for item in addresses}:
+        try:
+            if not ipaddress.ip_address(address).is_global:
+                raise HTTPException(status_code=400, detail="Local or private network URLs are not supported")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="The article host resolved to an invalid address") from exc
+    return url
+
+
+async def _fetch_html(client: httpx.AsyncClient, url: str) -> tuple[str, int, str]:
+    """Fetch HTML with redirect validation and a bounded response size."""
+    current = await _validate_public_url(url)
+    for _ in range(6):
+        response = await client.get(current, headers=REQUEST_HEADERS, follow_redirects=False)
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("location")
+            if not location:
+                raise HTTPException(status_code=502, detail="Publisher returned an invalid redirect")
+            current = await _validate_public_url(urljoin(current, location))
+            continue
+
+        if response.status_code in {401, 403, 451}:
+            raise HTTPException(
+                status_code=403,
+                detail="The publisher blocked automated access. Open the original article or paste text you are authorized to read.",
+            )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Publisher returned HTTP {response.status_code}")
+
+        content_type = response.headers.get("content-type", "").lower()
+        if (
+            content_type
+            and "html" not in content_type
+            and "xml" not in content_type
+            and "text/plain" not in content_type
+        ):
+            raise HTTPException(status_code=415, detail="The URL did not return an HTML article")
+        if len(response.content) > MAX_RESPONSE_BYTES:
+            raise HTTPException(status_code=413, detail="The article page is too large to process")
+        return response.text, response.status_code, str(response.url)
+
+    raise HTTPException(status_code=502, detail="Publisher redirected too many times")
 
 
 def _find_amp_url(html: str, base_url: str) -> Optional[str]:
@@ -207,7 +267,6 @@ def _find_amp_url(html: str, base_url: str) -> Optional[str]:
             if href.startswith("//"):
                 href = "https:" + href
             elif href.startswith("/"):
-                from urllib.parse import urljoin
                 href = urljoin(base_url, href)
             if href.startswith("http") and href != base_url:
                 return href
@@ -226,155 +285,115 @@ def _markdown_to_html(md: str) -> str:
         heading = re.match(r"^(#{1,4})\s+(.*)", block)
         if heading:
             level = len(heading.group(1))
-            html_parts.append(f"<h{level}>{heading.group(2).strip()}</h{level}>")
+            html_parts.append(f"<h{level}>{html_lib.escape(heading.group(2).strip())}</h{level}>")
         else:
-            html_parts.append(f"<p>{block}</p>")
+            html_parts.append(f"<p>{html_lib.escape(block)}</p>")
     return "\n".join(html_parts)
 
 
-async def fetch_with_bypass(url: str) -> tuple[str, int, str, str, bool, bool]:
-    """
-    Fetch article HTML using a cascade of strategies.
+async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, Optional[str]]:
+    """Fetch public article HTML and classify restricted/blocked responses."""
+    timeout = httpx.Timeout(30.0, connect=12.0)
+    async with httpx.AsyncClient(timeout=timeout, verify=True) as client:
+        html, status, final_url = await _fetch_html(client, url)
+        direct_text = await asyncio.to_thread(_extract_main_text, html)
 
-    Returns (html, status_code, final_url, strategy_name, reader_mode, partial).
-
-    Direct header strategies come first. If a direct fetch succeeds but only
-    yields a teaser (soft paywall), we remember it and keep trying AMP, archive
-    and reader-proxy fallbacks, ultimately returning whichever source gave the
-    most real article text.
-    """
-    last_error = "no attempt made"
-    best: Optional[tuple[int, tuple]] = None  # (text_len, payload tuple)
-    first_direct_html: Optional[str] = None
-
-    def consider(payload: tuple, text_len: int):
-        nonlocal best
-        if best is None or text_len > best[0]:
-            best = (text_len, payload)
-
-    def finalize(payload: tuple) -> tuple:
-        """Append the `partial` (paywall-teaser) flag to a 5-tuple payload."""
-        text_preview = trafilatura.extract(payload[0], favor_recall=True) or ""
-        return (*payload, _looks_paywalled(text_preview))
-
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(30.0),
-        verify=False,
-        headers={"Accept-Encoding": "gzip, deflate"},
-    ) as client:
-        # --- Phase 1: direct fetch with header rotation ---
-        for strategy in HEADER_STRATEGIES:
-            try:
-                resp = await client.get(url, headers=strategy["headers"])
-                if resp.status_code < 400 and len(resp.text) > 1000:
-                    if first_direct_html is None:
-                        first_direct_html = resp.text
-                    tlen = await asyncio.to_thread(_quick_text_len, resp.text)
-                    payload = (resp.text, resp.status_code, str(resp.url), strategy["name"], False)
-                    if tlen >= GOOD_TEXT_THRESHOLD:
-                        return (*payload, False)
-                    consider(payload, tlen)
-                else:
-                    last_error = f"{strategy['name']}: HTTP {resp.status_code}"
-            except httpx.HTTPError as e:
-                last_error = f"{strategy['name']}: {e}"
-                continue
-
-        # --- Phase 1b: AMP version (often served without the paywall) ---
-        amp_url = _find_amp_url(first_direct_html, url) if first_direct_html else None
-        if amp_url:
-            try:
-                resp = await client.get(amp_url, headers=HEADER_STRATEGIES[1]["headers"])
-                if resp.status_code == 200 and len(resp.text) > 1000:
-                    tlen = await asyncio.to_thread(_quick_text_len, resp.text)
-                    payload = (resp.text, 200, str(resp.url), "google_chrome", False)
-                    if tlen >= GOOD_TEXT_THRESHOLD:
-                        return (*payload, False)
-                    consider(payload, tlen)
-            except httpx.HTTPError as e:
-                last_error = f"amp: {e}"
-
-        # --- Phase 2: archive.today (great for FT / WSJ / Bloomberg) ---
-        try:
-            arch_url = f"https://archive.ph/newest/{url}"
-            resp = await client.get(
-                arch_url,
-                headers={"User-Agent": _BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"},
-                timeout=25.0,
+        if _looks_blocked(html, direct_text):
+            raise HTTPException(
+                status_code=502,
+                detail="The publisher returned an anti-bot or CAPTCHA page instead of the article.",
             )
-            if resp.status_code in (200, 429) and len(resp.text) > 1500:
-                tlen = await asyncio.to_thread(_quick_text_len, resp.text)
-                consider((resp.text, 200, str(resp.url), "archive_today", False), tlen)
-                if tlen >= GOOD_TEXT_THRESHOLD:
-                    return finalize(best[1])
-            else:
-                last_error = f"archive.today: HTTP {resp.status_code}"
-        except httpx.HTTPError as e:
-            last_error = f"archive.today: {e}"
-
-        # --- Phase 3: Jina reader proxy (renders JS, strips paywalls) ---
-        try:
-            jina_url = f"https://r.jina.ai/{url}"
-            resp = await client.get(
-                jina_url,
-                headers={
-                    "User-Agent": _BROWSER_UA,
-                    "X-Return-Format": "html",
-                    "Accept": "text/html,*/*",
-                },
-                timeout=45.0,
+        if _looks_restricted(html, direct_text):
+            return (
+                html,
+                status,
+                final_url,
+                "direct",
+                False,
+                True,
+                "restricted_preview",
+                RESTRICTED_NOTICE,
             )
-            if resp.status_code == 200 and len(resp.text) > 500:
-                body = resp.text
-                looks_like_html = "<" in body[:200]
-                html_body = body if looks_like_html else _markdown_to_html(body)
-                tlen = await asyncio.to_thread(_quick_text_len, html_body)
-                if tlen < 200:  # trafilatura found little; treat raw as the text
-                    html_body = f"<html><body><article>{html_body}</article></body></html>"
-                    tlen = len(re.sub(r"<[^>]+>", "", html_body))
-                consider((html_body, 200, url, "jina_reader", True), tlen)
-                if tlen >= GOOD_TEXT_THRESHOLD:
-                    return finalize(best[1])
-            else:
-                last_error = f"reader proxy: HTTP {resp.status_code}"
-        except httpx.HTTPError as e:
-            last_error = f"reader proxy: {e}"
 
-        # --- Phase 4: Wayback Machine ---
-        try:
-            wb_api = f"https://archive.org/wayback/available?url={url}"
-            wb_resp = await client.get(wb_api, timeout=12.0)
-            if wb_resp.status_code == 200:
-                snap = (wb_resp.json()
-                        .get("archived_snapshots", {})
-                        .get("closest", {})
-                        .get("url"))
-                if snap:
-                    snap_resp = await client.get(
-                        snap, headers={"User-Agent": _BROWSER_UA}, timeout=25.0
-                    )
-                    if snap_resp.status_code == 200 and len(snap_resp.text) > 1000:
-                        tlen = await asyncio.to_thread(_quick_text_len, snap_resp.text)
-                        consider((snap_resp.text, 200, url, "wayback_machine", False), tlen)
-        except Exception as e:
-            last_error = f"wayback: {e}"
+        best_html = html
+        best_text = direct_text
+        best_url = final_url
+        best_status = status
+        best_strategy = "direct"
+        reader_mode = False
 
-    if best is not None:
-        return finalize(best[1])
+        if len(direct_text) < GOOD_TEXT_THRESHOLD:
+            amp_url = _find_amp_url(html, final_url)
+            if amp_url:
+                try:
+                    amp_html, amp_status, resolved_amp = await _fetch_html(client, amp_url)
+                    amp_text = await asyncio.to_thread(_extract_main_text, amp_html)
+                    if (
+                        not _looks_blocked(amp_html, amp_text)
+                        and not _looks_restricted(amp_html, amp_text)
+                        and len(amp_text) > len(best_text)
+                    ):
+                        best_html = amp_html
+                        best_text = amp_text
+                        best_url = resolved_amp
+                        best_status = amp_status
+                        best_strategy = "amp"
+                except HTTPException:
+                    pass
 
-    raise HTTPException(status_code=502, detail=f"All fetch strategies failed. Last error: {last_error}")
+        # This fallback only runs after the publisher page was classified as
+        # public. Restricted previews are returned above without proxying.
+        if len(best_text) < GOOD_TEXT_THRESHOLD:
+            reader_url = f"https://r.jina.ai/{final_url}"
+            try:
+                reader_body, _, _ = await _fetch_html(client, reader_url)
+                reader_html = (
+                    reader_body
+                    if "<" in reader_body[:200]
+                    else _markdown_to_html(reader_body)
+                )
+                reader_text = await asyncio.to_thread(_extract_main_text, reader_html)
+                if (
+                    not _looks_blocked(reader_html, reader_text)
+                    and not _looks_restricted(reader_html, reader_text)
+                    and len(reader_text) > len(best_text)
+                ):
+                    best_html = reader_html
+                    best_text = reader_text
+                    best_strategy = "jina_reader"
+                    reader_mode = True
+            except HTTPException:
+                pass
+
+        notice = None
+        if not best_text.strip():
+            notice = "The page loaded, but no readable article body was found."
+        return (
+            best_html,
+            best_status,
+            best_url,
+            best_strategy,
+            reader_mode,
+            False,
+            "public",
+            notice,
+        )
 
 
 def sanitize_html_for_display(raw_html: str) -> str:
     """Extract article HTML via readability, then sanitize for safe iframe display."""
-    doc = ReadabilityDocument(raw_html)
-    article_html = doc.summary()
-
     from lxml.html import document_fromstring, tostring
     from lxml.html.clean import Cleaner
 
-    tree = document_fromstring(article_html)
+    try:
+        article_html = ReadabilityDocument(raw_html).summary()
+    except Exception:
+        article_html = raw_html
+
+    try:
+        tree = document_fromstring(article_html or "<article></article>")
+    except Exception:
+        tree = document_fromstring("<article></article>")
     cleaner = Cleaner(
         scripts=True,
         javascript=True,
@@ -396,8 +415,15 @@ def sanitize_html_for_display(raw_html: str) -> str:
 
 
 def _extract_meta_fallback(html: str) -> dict:
-    """Extract title/author/date/sitename/language from OG, meta tags and JSON-LD."""
-    result = {"title": None, "author": None, "date": None, "sitename": None, "language": None}
+    """Extract article metadata from Open Graph, HTML, and nested JSON-LD."""
+    result = {
+        "title": None,
+        "author": None,
+        "date": None,
+        "description": None,
+        "sitename": None,
+        "language": None,
+    }
     try:
         soup = BeautifulSoup(html, "lxml")
 
@@ -407,11 +433,16 @@ def _extract_meta_fallback(html: str) -> dict:
 
         result["title"] = (
             meta("og:title")
-            or meta("twitter:title")
+            or meta("twitter:title", attr="name")
             or meta("title", attr="name")
             or (soup.title.get_text(strip=True) if soup.title else None)
         )
         result["sitename"] = meta("og:site_name")
+        result["description"] = (
+            meta("og:description")
+            or meta("twitter:description", attr="name")
+            or meta("description", attr="name")
+        )
         result["author"] = meta("article:author") or meta("author", attr="name")
         result["date"] = (
             meta("article:published_time")
@@ -428,28 +459,55 @@ def _extract_meta_fallback(html: str) -> dict:
         if html_tag and html_tag.get("lang"):
             result["language"] = html_tag["lang"].split("-")[0].lower()
 
-        if not result["author"] or not result["date"]:
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    if isinstance(data, list):
-                        data = data[0]
-                    if not isinstance(data, dict):
-                        continue
-                    if not result["author"]:
-                        af = data.get("author") or data.get("creator")
-                        if isinstance(af, dict):
-                            result["author"] = af.get("name")
-                        elif isinstance(af, list) and af:
-                            result["author"] = af[0].get("name") if isinstance(af[0], dict) else str(af[0])
-                        elif isinstance(af, str):
-                            result["author"] = af
-                    if not result["date"]:
-                        rd = data.get("datePublished") or data.get("dateCreated")
-                        if rd:
-                            result["date"] = rd.split("T")[0] if "T" in rd else rd
-                except Exception:
+        def iter_nodes(value):
+            if isinstance(value, dict):
+                yield value
+                for nested in value.values():
+                    if isinstance(nested, (dict, list)):
+                        yield from iter_nodes(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    yield from iter_nodes(nested)
+
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+            except Exception:
+                continue
+            for node in iter_nodes(data):
+                node_type = node.get("@type", "")
+                if isinstance(node_type, list):
+                    node_type = " ".join(str(item) for item in node_type)
+                if "article" not in str(node_type).lower() and not any(
+                    key in node for key in ("headline", "datePublished", "articleBody")
+                ):
                     continue
+
+                result["title"] = result["title"] or node.get("headline") or node.get("name")
+                result["description"] = result["description"] or node.get("description")
+
+                if not result["author"]:
+                    authors = node.get("author") or node.get("creator")
+                    if not isinstance(authors, list):
+                        authors = [authors] if authors else []
+                    names = []
+                    for author in authors:
+                        if isinstance(author, dict) and author.get("name"):
+                            names.append(str(author["name"]))
+                        elif isinstance(author, str):
+                            names.append(author)
+                    if names:
+                        result["author"] = ", ".join(dict.fromkeys(names))
+
+                if not result["date"]:
+                    published = node.get("datePublished") or node.get("dateCreated")
+                    if published:
+                        result["date"] = str(published).split("T")[0]
+
+                if not result["sitename"]:
+                    publisher = node.get("publisher")
+                    if isinstance(publisher, dict):
+                        result["sitename"] = publisher.get("name")
     except Exception:
         pass
     return result
@@ -524,7 +582,16 @@ def _chunk_text(text: str, max_size: int = 4500) -> list[str]:
 
 @app.post("/api/fetch", response_model=FetchResponse)
 async def api_fetch(req: FetchRequest):
-    html, status, final_url, strategy, reader_mode, partial = await fetch_with_bypass(req.url)
+    (
+        html,
+        status,
+        final_url,
+        strategy,
+        reader_mode,
+        partial,
+        access_status,
+        notice,
+    ) = await fetch_article(req.url)
     clean_html = await asyncio.to_thread(sanitize_html_for_display, html)
     return FetchResponse(
         html=html,
@@ -534,6 +601,8 @@ async def api_fetch(req: FetchRequest):
         strategy_used=strategy,
         reader_mode=reader_mode,
         partial=partial,
+        access_status=access_status,
+        notice=notice,
     )
 
 
@@ -574,6 +643,7 @@ async def api_extract(req: ExtractRequest):
     title    = title    or meta.get("title")
     author   = author   or meta.get("author")
     date     = date     or meta.get("date")
+    description = description or meta.get("description")
     sitename = sitename or meta.get("sitename")
     language = language or meta.get("language")
 
