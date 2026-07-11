@@ -516,7 +516,7 @@
                 <div class="flex-1">
                     <p class="text-red-300 font-semibold text-sm">Couldn't load this article</p>
                     <p id="error-text" class="text-red-400/70 text-sm mt-1"></p>
-                    <p class="text-gray-400 text-xs mt-3 mb-2">Open the publisher page, copy the link, or paste text you are authorized to read:</p>
+                    <p class="text-gray-400 text-xs mt-3 mb-2">Open the publisher page, find public coverage of the same story, or paste text you are authorized to read:</p>
                     <div id="error-readers" class="flex flex-wrap gap-2"></div>
                 </div>
                 <button id="error-close" class="text-red-400/50 hover:text-red-400 transition-colors">
@@ -581,7 +581,7 @@
                 <svg class="w-4 h-4 text-amber-300 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
                 <div class="text-amber-200/90 flex-1">
                     <span class="font-semibold">Publisher preview loaded.</span>
-                    <span id="partial-message">The full article requires publisher access. You can still use the public metadata and preview, or paste text from your authorized session.</span>
+                    <span id="partial-message">The full article requires publisher access. Use the preview, find public reporting on the same story, or paste text from your authorized session.</span>
                     <div id="partial-readers" class="flex flex-wrap gap-2 mt-2.5"></div>
                 </div>
             </div>
@@ -769,6 +769,14 @@
         orig.className = 'ext-reader';
         orig.innerHTML = `<span>Open publisher</span>${EXT_ICON}`;
         container.appendChild(orig);
+
+        const coverage = document.createElement('a');
+        const coverageQuery = state.extractedData?.title || url;
+        coverage.href = 'https://news.google.com/search?q=' + encodeURIComponent(coverageQuery);
+        coverage.target = '_blank'; coverage.rel = 'noopener noreferrer';
+        coverage.className = 'ext-reader';
+        coverage.innerHTML = `<span>Find public coverage</span>${EXT_ICON}`;
+        container.appendChild(coverage);
 
         const copy = document.createElement('button');
         copy.className = 'ext-reader';
@@ -999,7 +1007,7 @@
             el.readerNote.classList.toggle('hidden', !state.readerMode);
             el.partialNote.classList.toggle('hidden', !f.partial);
             if (f.partial) {
-                el.partialMessage.textContent = f.notice || 'The full article requires publisher access. You can still use the public metadata and preview, or paste text from your authorized session.';
+                el.partialMessage.textContent = f.notice || 'The full article requires publisher access. Use the preview, find public reporting on the same story, or paste text from your authorized session.';
                 renderRecoveryActions(el.partialReaders, url);
             }
             if (!f.partial && f.notice) toast(f.notice);
