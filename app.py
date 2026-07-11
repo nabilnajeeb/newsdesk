@@ -707,7 +707,14 @@ async def api_translate(req: TranslateRequest):
 @app.get("/", response_class=HTMLResponse)
 async def root():
     index = Path(__file__).parent / "static" / "index.html"
-    return HTMLResponse(content=index.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        content=index.read_text(encoding="utf-8"),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
