@@ -1027,6 +1027,17 @@ async def api_fetch(req: FetchRequest):
         clean_html = await asyncio.to_thread(sanitize_reader_html, html)
     else:
         clean_html = await asyncio.to_thread(sanitize_html_for_display, html)
+    # If readability produced almost nothing, build clean HTML from the
+    # extracted text so the user still sees the recovered article body.
+    if len(clean_html) < 500 and access_status in ("recovered", "restricted_preview", "public"):
+        extracted = await asyncio.to_thread(_extract_page_text, html)
+        if extracted and len(extracted.strip()) > 50:
+            paras = "\n".join(
+                f"<p>{html_lib.escape(p.strip())}</p>"
+                for p in re.split(r"\n{2,}", extracted.strip())
+                if p.strip()
+            )
+            clean_html = f"<article>{paras}</article>"
     return FetchResponse(
         html=html,
         clean_html=clean_html,
