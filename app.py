@@ -269,12 +269,19 @@ async def _fetch_html(
     headers: Optional[dict] = None,
     allow_block: bool = False,
     impersonate: bool = True,
+    reader_proxy: bool = False,
 ) -> tuple[str, int, str]:
     """Fetch HTML with redirect validation, TLS impersonation, and bounded size."""
     current = await _validate_public_url(url)
-    chosen_headers = headers or (IMPERSONATED_HEADERS if impersonate else REQUEST_HEADERS)
+    if reader_proxy:
+        chosen_headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; FeedReader/1.0)",
+            "Accept": "text/plain, text/markdown, text/html, */*;q=0.5",
+        }
+    else:
+        chosen_headers = headers or (IMPERSONATED_HEADERS if impersonate else REQUEST_HEADERS)
     for _ in range(8):
-        if impersonate:
+        if impersonate and not reader_proxy:
             try:
                 text, status, resp_headers, final = await asyncio.to_thread(
                     _curl_get, current, chosen_headers
@@ -614,16 +621,19 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     continue
 
         # 4. Reader proxy (renders the page server-side).
+        # NOTE: r.jina.ai refuses browser-like fingerprints (curl_cffi
+        # impersonation or rich UA headers) with 403, so fetch it plainly.
         if needs_more():
             reader_url = f"https://r.jina.ai/{final_url}"
             try:
-                reader_body, _, _ = await _fetch_html(client, reader_url, impersonate=True)
+                reader_body, _status, _ = await _fetch_html(client, reader_url, impersonate=False, reader_proxy=True)
                 reader_html = (
                     reader_body
                     if "<" in reader_body[:200]
                     else _markdown_to_html(reader_body)
                 )
                 reader_text = await _better_text(reader_html, len(best_text))
+                logger.info("jina_reader: status=%s words=%s", _status, len(reader_text.split()) if reader_text else 0)
                 if reader_text:
                     best_html = reader_html
                     best_text = reader_text
