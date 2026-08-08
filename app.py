@@ -1059,6 +1059,15 @@ async def api_fetch(req: FetchRequest):
                 if p.strip()
             )
             clean_html = f"<article>{paras}</article>"
+    # When the content is a paywall pitch (not real article body), replace
+    # the iframe content with just the title so the user isn't misled.
+    if access_status == "restricted_preview" and notice and "hard paywall" in notice:
+        meta = _extract_meta_fallback(html)
+        title = meta.get("title") or ""
+        clean_html = (
+            f'<article><h1>{html_lib.escape(title)}</h1>'
+            f"<p><em>{html_lib.escape(notice)}</em></p></article>"
+        )
     return FetchResponse(
         html=html,
         clean_html=clean_html,
