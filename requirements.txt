@@ -1,9 +1,11 @@
 fastapi
 uvicorn[standard]
 httpx
+curl_cffi
 trafilatura
 readability-lxml
 deep-translator
 lxml
+lxml_html_clean
 beautifulsoup4
 py3langid

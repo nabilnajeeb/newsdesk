@@ -111,6 +111,14 @@ REQUEST_HEADERS = {
     **_SEC_HEADERS,
 }
 
+# When using curl_cffi TLS impersonation, the library sets its own browser
+# fingerprint headers. Adding sec-ch-ua / Sec-Fetch-* manually can trigger
+# WSJ's bot detection (401), so we use minimal headers for impersonated fetches.
+IMPERSONATED_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
@@ -138,6 +146,11 @@ RESTRICTED_NOTICE = (
     "The publisher returned a subscriber-only preview. NewsDesk preserved the "
     "public title and metadata, but it cannot retrieve content your account is "
     "not authorized to access."
+)
+
+RECOVERED_NOTICE = (
+    "The publisher restricts this article, but the full text was recovered from "
+    "a public archive or reader proxy."
 )
 
 
@@ -222,39 +235,119 @@ async def _validate_public_url(url: str) -> str:
     return url
 
 
-async def _fetch_html(client: httpx.AsyncClient, url: str) -> tuple[str, int, str]:
-    """Fetch HTML with redirect validation and a bounded response size."""
+def _curl_get(url: str, headers: dict) -> tuple[str, int, dict, str]:
+    """Perform a TLS-impersonated GET (looks like real Chrome) to evade bot blocks."""
+    from curl_cffi import requests as curl_requests
+
+    resp = curl_requests.get(
+        url,
+        impersonate="chrome131",
+        headers=headers,
+        timeout=45.0,
+        allow_redirects=False,
+    )
+    return resp.text, resp.status_code, dict(resp.headers), str(resp.url)
+
+
+async def _fetch_html(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Optional[dict] = None,
+    allow_block: bool = False,
+    impersonate: bool = True,
+) -> tuple[str, int, str]:
+    """Fetch HTML with redirect validation, TLS impersonation, and bounded size."""
     current = await _validate_public_url(url)
-    for _ in range(6):
-        response = await client.get(current, headers=REQUEST_HEADERS, follow_redirects=False)
-        if response.status_code in {301, 302, 303, 307, 308}:
-            location = response.headers.get("location")
+    chosen_headers = headers or (IMPERSONATED_HEADERS if impersonate else REQUEST_HEADERS)
+    for _ in range(8):
+        if impersonate:
+            try:
+                text, status, resp_headers, final = await asyncio.to_thread(
+                    _curl_get, current, chosen_headers
+                )
+            except Exception:
+                text, status, resp_headers, final = await _httpx_get(
+                    client, current, REQUEST_HEADERS
+                )
+        else:
+            text, status, resp_headers, final = await _httpx_get(
+                client, current, chosen_headers
+            )
+
+        if status in {301, 302, 303, 307, 308}:
+            location = resp_headers.get("location")
             if not location:
                 raise HTTPException(status_code=502, detail="Publisher returned an invalid redirect")
             current = await _validate_public_url(urljoin(current, location))
             continue
 
-        if response.status_code in {401, 403, 451}:
+        if status in {401, 403, 451}:
+            if allow_block:
+                return "", status, current
             raise HTTPException(
                 status_code=403,
                 detail="The publisher blocked automated access. Open the original article or paste text you are authorized to read.",
             )
-        if response.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"Publisher returned HTTP {response.status_code}")
+        if status >= 400:
+            raise HTTPException(status_code=502, detail=f"Publisher returned HTTP {status}")
 
-        content_type = response.headers.get("content-type", "").lower()
+        content_type = resp_headers.get("content-type", "").lower()
         if (
             content_type
             and "html" not in content_type
             and "xml" not in content_type
             and "text/plain" not in content_type
+            and "text/markdown" not in content_type
         ):
             raise HTTPException(status_code=415, detail="The URL did not return an HTML article")
-        if len(response.content) > MAX_RESPONSE_BYTES:
+        if len(text) > MAX_RESPONSE_BYTES:
             raise HTTPException(status_code=413, detail="The article page is too large to process")
-        return response.text, response.status_code, str(response.url)
+        return text, status, final
 
     raise HTTPException(status_code=502, detail="Publisher redirected too many times")
+
+
+async def _httpx_get(
+    client: httpx.AsyncClient, url: str, headers: dict
+) -> tuple[str, int, dict, str]:
+    """Plain httpx fallback used when curl_cffi is unavailable."""
+    resp = await client.get(url, headers=headers, follow_redirects=False)
+    return resp.text, resp.status_code, dict(resp.headers), str(resp.url)
+
+
+def _extract_embedded_text(html: str) -> str:
+    """Pull article paragraphs out of embedded JSON payloads (WSJ and similar).
+
+    Many modern publishers (notably WSJ) render the article client-side from a
+    JSON blob but also embed the full text for SEO crawlers. trafilatura misses
+    it because the paragraphs live inside <script> tags. This reconstructs them.
+    """
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', html):
+        try:
+            t = m.group(1).encode().decode("unicode_escape", errors="ignore")
+        except Exception:
+            t = m.group(1)
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) < 80:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        blocks.append(t)
+    if len(blocks) < 3:
+        return ""
+    return "\n\n".join(blocks)
+
+
+def _extract_page_text(html: str) -> str:
+    """Best-effort main-text extraction combining trafilatura and JSON mining."""
+    traf = _extract_main_text(html)
+    embedded = _extract_embedded_text(html)
+    if len(embedded) > len(traf) + 200:
+        return embedded
+    return traf or embedded
 
 
 def _find_amp_url(html: str, base_url: str) -> Optional[str]:
@@ -275,6 +368,103 @@ def _find_amp_url(html: str, base_url: str) -> Optional[str]:
     return None
 
 
+async def _find_snapshot_urls(
+    client: httpx.AsyncClient, url: str, limit: int = 8
+) -> list[str]:
+    """Collect candidate public-archive captures (Wayback CDX + availability + Memento)."""
+    snapshots: list[str] = []
+    seen: set[str] = set()
+
+    # 1. Wayback CDX search — most reliable for WSJ/FT and returns newest first.
+    try:
+        resp = await client.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params={
+                "url": url,
+                "output": "json",
+                "fl": "timestamp,statuscode",
+                "filter": "statuscode:200",
+                "limit": str(limit * 2),
+            },
+            timeout=30.0,
+        )
+        if resp.status_code == 200:
+            rows = resp.json()
+            newest = []
+            for row in rows[1:]:
+                if len(row) >= 2 and str(row[1]).startswith("2"):
+                    newest.append(row[0])
+            for ts in reversed(newest):
+                snap = f"https://web.archive.org/web/{ts}id_/{url}"
+                if snap not in seen:
+                    snapshots.append(snap)
+                    seen.add(snap)
+                    if len(snapshots) >= limit:
+                        return snapshots
+    except Exception:
+        pass
+
+    # 2. Wayback availability API (closest snapshot).
+    try:
+        wb = await _find_wayback_url(client, url)
+        if wb and wb not in seen:
+            snapshots.append(wb)
+            seen.add(wb)
+    except Exception:
+        pass
+
+    # 3. Memento aggregator (covers archive.today and regional archives).
+    from datetime import datetime, timezone
+
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    try:
+        response = await client.get(
+            f"https://timetravel.mementoweb.org/api/json/{day}/{url}",
+            timeout=30.0,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            for group in ("list", "first"):
+                for memento in (payload.get("mementos") or {}).get(group, []) or []:
+                    uri = memento.get("uri") if isinstance(memento, dict) else None
+                    if uri and uri not in seen:
+                        snapshots.append(uri)
+                        seen.add(uri)
+                        if len(snapshots) >= limit * 2:
+                            return snapshots
+    except Exception:
+        pass
+
+    return snapshots
+
+
+async def _find_wayback_url(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    """Return the closest Wayback Machine capture of a URL, if any."""
+    try:
+        response = await client.get(
+            "https://archive.org/wayback/available",
+            params={"url": url},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        snapshot = ((response.json().get("archived_snapshots") or {}).get("closest") or {}).get("url")
+        return snapshot or None
+    except Exception:
+        return None
+
+
+async def _better_text(html: str, current_len: int) -> Optional[str]:
+    """Extract page text; return it only if it beats the current best by a margin."""
+    text = await asyncio.to_thread(_extract_page_text, html)
+    if not text:
+        return None
+    if _looks_blocked(html, text):
+        return None
+    if len(text) < current_len + 400:
+        return None
+    return text
+
+
 def _markdown_to_html(md: str) -> str:
     """Very small markdown -> HTML converter for reader-proxy output."""
     html_parts = []
@@ -293,27 +483,22 @@ def _markdown_to_html(md: str) -> str:
 
 async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, Optional[str]]:
     """Fetch public article HTML and classify restricted/blocked responses."""
-    timeout = httpx.Timeout(30.0, connect=12.0)
+    timeout = httpx.Timeout(40.0, connect=12.0)
     async with httpx.AsyncClient(timeout=timeout, verify=True) as client:
-        html, status, final_url = await _fetch_html(client, url)
-        direct_text = await asyncio.to_thread(_extract_main_text, html)
+        html, status, final_url = await _fetch_html(
+            client, url, allow_block=True, impersonate=True
+        )
+        direct_text = await asyncio.to_thread(_extract_page_text, html)
+        direct_blocked = status in {401, 403, 451}
 
-        if _looks_blocked(html, direct_text):
+        if _looks_blocked(html, direct_text) and not direct_blocked:
             raise HTTPException(
                 status_code=502,
                 detail="The publisher returned an anti-bot or CAPTCHA page instead of the article.",
             )
-        if _looks_restricted(html, direct_text):
-            return (
-                html,
-                status,
-                final_url,
-                "direct",
-                False,
-                True,
-                "restricted_preview",
-                RESTRICTED_NOTICE,
-            )
+        restricted = (_looks_restricted(html, direct_text) or direct_blocked) and (
+            len(direct_text) < GOOD_TEXT_THRESHOLD
+        )
 
         best_html = html
         best_text = direct_text
@@ -321,52 +506,128 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         best_status = status
         best_strategy = "direct"
         reader_mode = False
+        recovered = len(direct_text) >= GOOD_TEXT_THRESHOLD
 
-        if len(direct_text) < GOOD_TEXT_THRESHOLD:
+        needs_more = lambda: not recovered and (
+            len(best_text) < GOOD_TEXT_THRESHOLD or restricted
+        )
+
+        # 0. Social-media referrer refetch — many paywalled publishers
+        #    (notably FT) serve the full article when the Referer header
+        #    looks like a Facebook/Twitter share link.
+        if needs_more():
+            for ref_label, ref_url in (
+                ("social", "https://www.facebook.com/"),
+                ("google_news", "https://news.google.com/"),
+            ):
+                if not needs_more():
+                    break
+                try:
+                    ref_headers = {**IMPERSONATED_HEADERS, "Referer": ref_url}
+                    ref_html, ref_status, ref_url_resolved = await _fetch_html(
+                        client, final_url, headers=ref_headers, allow_block=True
+                    )
+                    ref_text = await _better_text(ref_html, len(best_text))
+                    if ref_text:
+                        best_html, best_text, best_url, best_status, best_strategy = (
+                            ref_html, ref_text, ref_url_resolved, ref_status, "social_referrer",
+                        )
+                        recovered = True
+                        restricted = False
+                        break
+                except HTTPException:
+                    continue
+
+        # 1. AMP version — often served without the paywall.
+        if needs_more():
             amp_url = _find_amp_url(html, final_url)
             if amp_url:
                 try:
                     amp_html, amp_status, resolved_amp = await _fetch_html(client, amp_url)
-                    amp_text = await asyncio.to_thread(_extract_main_text, amp_html)
-                    if (
-                        not _looks_blocked(amp_html, amp_text)
-                        and not _looks_restricted(amp_html, amp_text)
-                        and len(amp_text) > len(best_text)
-                    ):
-                        best_html = amp_html
-                        best_text = amp_text
-                        best_url = resolved_amp
-                        best_status = amp_status
-                        best_strategy = "amp"
+                    amp_text = await _better_text(amp_html, len(best_text))
+                    if amp_text:
+                        best_html, best_text, best_url, best_status, best_strategy = (
+                            amp_html, amp_text, resolved_amp, amp_status, "amp",
+                        )
+                        recovered = True
                 except HTTPException:
                     pass
 
-        # This fallback only runs after the publisher page was classified as
-        # public. Restricted previews are returned above without proxying.
-        if len(best_text) < GOOD_TEXT_THRESHOLD:
+        # 2. Public archive captures (Wayback CDX + availability + Memento).
+        if needs_more():
+            for snapshot in await _find_snapshot_urls(client, final_url):
+                if not needs_more():
+                    break
+                try:
+                    snap_html, snap_status, resolved_snap = await _fetch_html(
+                        client, snapshot, impersonate=False
+                    )
+                    snap_text = await _better_text(snap_html, len(best_text))
+                    if snap_text:
+                        best_html, best_text, best_url, best_status, best_strategy = (
+                            snap_html, snap_text, resolved_snap, snap_status, "archive",
+                        )
+                        recovered = True
+                        break
+                except HTTPException:
+                    continue
+
+        # 3. archive.today newest snapshot (works from many networks).
+        if needs_more():
+            for mirror in ("archive.ph", "archive.today", "archive.vn"):
+                if not needs_more():
+                    break
+                try:
+                    at_url = f"https://{mirror}/newest/{final_url}"
+                    at_html, at_status, at_resolved = await _fetch_html(
+                        client, at_url, impersonate=True
+                    )
+                    at_text = await _better_text(at_html, len(best_text))
+                    if at_text:
+                        best_html, best_text, best_url, best_status, best_strategy = (
+                            at_html, at_text, at_resolved, at_status, "archive_today",
+                        )
+                        recovered = True
+                        break
+                except HTTPException:
+                    continue
+
+        # 4. Reader proxy (renders the page server-side).
+        if needs_more():
             reader_url = f"https://r.jina.ai/{final_url}"
             try:
-                reader_body, _, _ = await _fetch_html(client, reader_url)
+                reader_body, _, _ = await _fetch_html(client, reader_url, impersonate=True)
                 reader_html = (
                     reader_body
                     if "<" in reader_body[:200]
                     else _markdown_to_html(reader_body)
                 )
-                reader_text = await asyncio.to_thread(_extract_main_text, reader_html)
-                if (
-                    not _looks_blocked(reader_html, reader_text)
-                    and not _looks_restricted(reader_html, reader_text)
-                    and len(reader_text) > len(best_text)
-                ):
+                reader_text = await _better_text(reader_html, len(best_text))
+                if reader_text:
                     best_html = reader_html
                     best_text = reader_text
                     best_strategy = "jina_reader"
                     reader_mode = True
+                    recovered = True
             except HTTPException:
                 pass
 
+        partial = False
+        access_status = "public"
         notice = None
-        if not best_text.strip():
+        if direct_blocked and best_strategy == "direct":
+            raise HTTPException(
+                status_code=403,
+                detail="The publisher blocked automated access and no public archive copy was found. Open the original article or paste text you are authorized to read.",
+            )
+        if restricted and best_strategy == "direct":
+            partial = True
+            access_status = "restricted_preview"
+            notice = RESTRICTED_NOTICE
+        elif restricted:
+            access_status = "recovered"
+            notice = RECOVERED_NOTICE
+        elif not best_text.strip():
             notice = "The page loaded, but no readable article body was found."
         return (
             best_html,
@@ -374,8 +635,8 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
             best_url,
             best_strategy,
             reader_mode,
-            False,
-            "public",
+            partial,
+            access_status,
             notice,
         )
 
@@ -648,6 +909,13 @@ async def api_extract(req: ExtractRequest):
     language = language or meta.get("language")
 
     cleaned_text = _clean_extracted_text(raw_text)
+
+    # trafilatura misses article text embedded in JSON payloads (e.g. WSJ).
+    # Always try mining <script> JSON for paragraph strings and use the
+    # longer result.
+    embedded = _extract_embedded_text(req.html)
+    if len(embedded) > len(cleaned_text) + 200:
+        cleaned_text = _clean_extracted_text(embedded)
 
     if not language:
         language = await asyncio.to_thread(_detect_language, cleaned_text)
