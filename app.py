@@ -758,7 +758,28 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                 status_code=403,
                 detail="The publisher blocked automated access and no public archive copy was found. Open the original article or paste text you are authorized to read.",
             )
-        if restricted and best_strategy == "direct":
+
+        # Detect when the "recovered" text is actually paywall/subscription
+        # pitch rather than real article content (common with FT on Wayback).
+        _PAYWALL_TEXT_MARKERS = (
+            "subscribe to unlock", "try unlimited access", "complete digital access",
+            "explore more offers", "standard digital", "premium digital",
+            "save 40%", "save now on essential", "then $75 per month",
+            "only $1 for 4 weeks",
+        )
+        best_lower = best_text.lower()
+        paywall_text_hits = sum(1 for m in _PAYWALL_TEXT_MARKERS if m in best_lower)
+        is_paywall_pitch = paywall_text_hits >= 2 and len(best_text.split()) < 400
+
+        if is_paywall_pitch:
+            access_status = "restricted_preview"
+            partial = True
+            notice = (
+                "This article is behind a hard paywall. The full text could not be "
+                "recovered from public archives or reader proxies from this server. "
+                "Open the original article or paste the text manually."
+            )
+        elif restricted and best_strategy == "direct":
             partial = True
             access_status = "restricted_preview"
             notice = RESTRICTED_NOTICE
