@@ -869,7 +869,7 @@
         items.forEach(h => el.metaChips.appendChild(chip(h)));
 
         if (strategy) {
-            const label = { direct:'Publisher page', amp:'Publisher AMP page', jina_reader:'Public reader fallback', pasted_text:'Pasted text' }[strategy] || strategy;
+            const label = { direct:'Publisher page', amp:'Publisher AMP page', jina_reader:'Reader proxy', social_referrer:'Shared-link access', archive:'Archived copy', archive_today:'Archive.today copy', pasted_text:'Pasted text' }[strategy] || strategy;
             const s = document.createElement('span');
             s.className = 'chip !cursor-default flex items-center gap-1.5';
             s.style.background = 'rgba(16,185,129,0.12)'; s.style.borderColor = 'rgba(16,185,129,0.25)'; s.style.color = '#6ee7b7';
