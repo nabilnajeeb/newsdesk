@@ -2,6 +2,7 @@ import asyncio
 import html as html_lib
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -21,6 +22,14 @@ from pydantic import BaseModel
 from readability import Document as ReadabilityDocument
 
 app = FastAPI()
+
+logger = logging.getLogger("app")
+
+try:
+    import curl_cffi as _curl_cffi_mod
+    logger.info("curl_cffi %s imported OK", getattr(_curl_cffi_mod, "__version__", "?"))
+except Exception as exc:
+    logger.warning("curl_cffi unavailable: %r", exc)
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -265,7 +274,8 @@ async def _fetch_html(
                 text, status, resp_headers, final = await asyncio.to_thread(
                     _curl_get, current, chosen_headers
                 )
-            except Exception:
+            except Exception as exc:
+                logger.warning("curl_cffi impersonation failed for %s: %r", current, exc)
                 text, status, resp_headers, final = await _httpx_get(
                     client, current, REQUEST_HEADERS
                 )
@@ -490,6 +500,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         )
         direct_text = await asyncio.to_thread(_extract_page_text, html)
         direct_blocked = status in {401, 403, 451}
+        logger.info("direct: url=%s status=%s blocked=%s words=%s", url, status, direct_blocked, len(direct_text.split()))
 
         if _looks_blocked(html, direct_text) and not direct_blocked:
             raise HTTPException(
@@ -528,6 +539,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         client, final_url, headers=ref_headers, allow_block=True
                     )
                     ref_text = await _better_text(ref_html, len(best_text))
+                    logger.info("social_referrer %s: status=%s words=%s", ref_label, ref_status, len(ref_text.split()) if ref_text else 0)
                     if ref_text:
                         best_html, best_text, best_url, best_status, best_strategy = (
                             ref_html, ref_text, ref_url_resolved, ref_status, "social_referrer",
@@ -564,6 +576,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     )
                     snap_text = await _better_text(snap_html, len(best_text))
                     if snap_text:
+                        logger.info("archive: snapshot=%s words=%s", snapshot, len(snap_text.split()))
                         best_html, best_text, best_url, best_status, best_strategy = (
                             snap_html, snap_text, resolved_snap, snap_status, "archive",
                         )
@@ -584,6 +597,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     )
                     at_text = await _better_text(at_html, len(best_text))
                     if at_text:
+                        logger.info("archive_today: mirror=%s status=%s words=%s", mirror, at_status, len(at_text.split()))
                         best_html, best_text, best_url, best_status, best_strategy = (
                             at_html, at_text, at_resolved, at_status, "archive_today",
                         )
@@ -615,6 +629,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         partial = False
         access_status = "public"
         notice = None
+        logger.info("fetch done: strategy=%s words=%s status=%s", best_strategy, len(best_text.split()), best_status)
         if direct_blocked and best_strategy == "direct":
             raise HTTPException(
                 status_code=403,
