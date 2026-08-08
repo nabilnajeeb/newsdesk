@@ -24,6 +24,11 @@ from readability import Document as ReadabilityDocument
 app = FastAPI()
 
 logger = logging.getLogger("app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
 
 try:
     import curl_cffi as _curl_cffi_mod
