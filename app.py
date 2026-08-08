@@ -499,8 +499,114 @@ def _markdown_to_html(md: str) -> str:
             level = len(heading.group(1))
             html_parts.append(f"<h{level}>{html_lib.escape(heading.group(2).strip())}</h{level}>")
         else:
-            html_parts.append(f"<p>{html_lib.escape(block)}</p>")
+            escaped = html_lib.escape(block)
+            escaped = re.sub(
+                r"\[([^\]]*)\]\(([^)]*)\)",
+                lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>',
+                escaped,
+            )
+            html_parts.append(f"<p>{escaped}</p>")
     return "\n".join(html_parts)
+
+
+# Short boilerplate lines that jina reader picks up from page chrome.
+_NAV_PATTERNS = (
+    "accessibility", "skip to", "sign in", "subscribe", "search",
+    "open side navigation", "close search", "se connecter", "s'abonner",
+    "voir la bourse", "en continu", "le journal", "mes articles",
+    "newsletters", "podcasts", "infographies", "le cercle", "recherche",
+    "open search", "menu", "log in", "register", "home", "contact",
+)
+
+
+def _process_jina_response(body: str) -> Optional[tuple[str, str]]:
+    """Parse jina reader markdown into (title, full_html).
+
+    Returns None when jina itself reports an error (404, CAPTCHA, etc.)
+    or when the response is a paywall page with no article body.
+    """
+    if not body or not body.strip():
+        return None
+
+    head = body[:3000]
+    if re.search(r"Warning:.*(?:error|CAPTCHA|blocked|forbidden|not found)", head, re.IGNORECASE):
+        return None
+
+    # Detect hard paywall pages (FT, WSJ, etc.) where jina only gets the
+    # subscription pitch — no article body is present.
+    _PAYWALL_MARKERS = (
+        "subscribe to unlock", "try unlimited access", "then $75 per month",
+        "only $1 for 4 weeks", "complete digital access",
+        "explore more offers", "standard digital", "premium digital",
+        "subscribe for full access", "to continue reading",
+    )
+    body_lower = body[:15000].lower()
+    paywall_hits = sum(1 for m in _PAYWALL_MARKERS if m in body_lower)
+    if paywall_hits >= 3:
+        return None
+
+    title = None
+    published = None
+    lines = body.split("\n")
+    content_start = 0
+    for i, line in enumerate(lines):
+        m = re.match(r"^Title:\s*(.+)", line)
+        if m:
+            title = m.group(1).strip()
+        m2 = re.match(r"^Published Time:\s*(.+)", line)
+        if m2:
+            published = m2.group(1).strip()
+        if re.match(r"^Markdown Content:", line):
+            content_start = i + 1
+            break
+
+    if content_start > 0:
+        content_md = "\n".join(lines[content_start:]).strip()
+    else:
+        content_md = body.strip()
+
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", content_md) if p.strip()]
+
+    def _vis_len(p):
+        return len(re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", p).strip())
+
+    # Drop leading boilerplate paragraphs (nav chrome, sign-in links, etc.).
+    while paragraphs:
+        first = paragraphs[0]
+        vis = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", first).strip().lower()
+        if _vis_len(first) < 100 and any(pat in vis for pat in _NAV_PATTERNS):
+            paragraphs.pop(0)
+            continue
+        if first.startswith("*") and _vis_len(first) < 120:
+            paragraphs.pop(0)
+            continue
+        break
+
+    # Drop trailing boilerplate (footer, "read more", cookie notices, etc.)
+    while paragraphs:
+        last = paragraphs[-1]
+        vis = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", last).strip().lower()
+        if _vis_len(last) < 100 and any(pat in vis for pat in _NAV_PATTERNS):
+            paragraphs.pop()
+            continue
+        if last.startswith("*") and _vis_len(last) < 120:
+            paragraphs.pop()
+            continue
+        break
+
+    if not paragraphs:
+        return None
+
+    content_html = _markdown_to_html("\n\n".join(paragraphs))
+    escaped_title = html_lib.escape(title) if title else ""
+    meta_pub = f'<meta property="article:published_time" content="{html_lib.escape(published)}">' if published else ""
+    full_html = (
+        f"<html><head><title>{escaped_title}</title>"
+        f'<meta property="og:title" content="{escaped_title}">'
+        f"{meta_pub}"
+        f"</head><body><article>{content_html}</article></body></html>"
+    )
+    return (title or "", full_html)
 
 
 async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, Optional[str]]:
@@ -627,19 +733,19 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
             reader_url = f"https://r.jina.ai/{final_url}"
             try:
                 reader_body, _status, _ = await _fetch_html(client, reader_url, impersonate=False, reader_proxy=True)
-                reader_html = (
-                    reader_body
-                    if "<" in reader_body[:200]
-                    else _markdown_to_html(reader_body)
-                )
-                reader_text = await _better_text(reader_html, len(best_text))
-                logger.info("jina_reader: status=%s words=%s", _status, len(reader_text.split()) if reader_text else 0)
-                if reader_text:
-                    best_html = reader_html
-                    best_text = reader_text
-                    best_strategy = "jina_reader"
-                    reader_mode = True
-                    recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+                processed = _process_jina_response(reader_body)
+                if processed:
+                    _jina_title, reader_html = processed
+                    reader_text = await _better_text(reader_html, len(best_text))
+                    logger.info("jina_reader: status=%s words=%s title=%s", _status, len(reader_text.split()) if reader_text else 0, _jina_title[:50])
+                    if reader_text:
+                        best_html = reader_html
+                        best_text = reader_text
+                        best_strategy = "jina_reader"
+                        reader_mode = True
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+                else:
+                    logger.info("jina_reader: status=%s (error/empty response, skipped)", _status)
             except HTTPException:
                 pass
 
@@ -873,6 +979,38 @@ def _chunk_text(text: str, max_size: int = 4500) -> list[str]:
 # API endpoints
 # ---------------------------------------------------------------------------
 
+def sanitize_reader_html(raw_html: str) -> str:
+    """Sanitize already-processed reader-proxy HTML for iframe display.
+
+    Unlike sanitize_html_for_display, this skips readability (which can
+    destroy the simple <article> structure from jina markdown) and just
+    cleans the article element with lxml.
+    """
+    from lxml.html import document_fromstring, tostring
+    from lxml.html.clean import Cleaner
+
+    try:
+        tree = document_fromstring(raw_html)
+    except Exception:
+        return raw_html
+
+    article = tree.find(".//article")
+    if article is not None:
+        subtree = article
+    else:
+        subtree = tree
+
+    cleaner = Cleaner(
+        scripts=True, javascript=True, embedded=True, frames=True,
+        forms=True, meta=False, page_structure=False,
+        processing_instructions=True, remove_unknown_tags=False,
+        safe_attrs_only=True, style=False, inline_style=False,
+        links=False, add_nofollow=True,
+    )
+    cleaned = cleaner.clean_html(subtree)
+    return tostring(cleaned, encoding="unicode")
+
+
 @app.post("/api/fetch", response_model=FetchResponse)
 async def api_fetch(req: FetchRequest):
     (
@@ -885,7 +1023,10 @@ async def api_fetch(req: FetchRequest):
         access_status,
         notice,
     ) = await fetch_article(req.url)
-    clean_html = await asyncio.to_thread(sanitize_html_for_display, html)
+    if reader_mode:
+        clean_html = await asyncio.to_thread(sanitize_reader_html, html)
+    else:
+        clean_html = await asyncio.to_thread(sanitize_html_for_display, html)
     return FetchResponse(
         html=html,
         clean_html=clean_html,
