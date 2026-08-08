@@ -549,8 +549,8 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         best_html, best_text, best_url, best_status, best_strategy = (
                             ref_html, ref_text, ref_url_resolved, ref_status, "social_referrer",
                         )
-                        recovered = True
                         restricted = False
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
                         break
                 except HTTPException:
                     continue
@@ -566,7 +566,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         best_html, best_text, best_url, best_status, best_strategy = (
                             amp_html, amp_text, resolved_amp, amp_status, "amp",
                         )
-                        recovered = True
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
                 except HTTPException:
                     pass
 
@@ -585,8 +585,9 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         best_html, best_text, best_url, best_status, best_strategy = (
                             snap_html, snap_text, resolved_snap, snap_status, "archive",
                         )
-                        recovered = True
-                        break
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+                        if recovered:
+                            break
                 except HTTPException:
                     continue
 
@@ -606,8 +607,9 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         best_html, best_text, best_url, best_status, best_strategy = (
                             at_html, at_text, at_resolved, at_status, "archive_today",
                         )
-                        recovered = True
-                        break
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+                        if recovered:
+                            break
                 except HTTPException:
                     continue
 
@@ -627,7 +629,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     best_text = reader_text
                     best_strategy = "jina_reader"
                     reader_mode = True
-                    recovered = True
+                    recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
             except HTTPException:
                 pass
 
