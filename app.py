@@ -337,6 +337,117 @@ async def _httpx_get(
     return resp.text, resp.status_code, dict(resp.headers), str(resp.url)
 
 
+# ---------------------------------------------------------------------------
+# Public-proxy refetch — bypasses datacenter IP blocks (FT blocks AWS ranges).
+# A free public HTTP proxy provides a non-blocked exit IP while we keep the
+# social-referer trick that makes FT serve the full article.
+# ---------------------------------------------------------------------------
+
+_PROXY_STATE: dict = {"list": [], "ts": 0.0, "good": []}
+_PROXY_SOURCES = (
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-LIST/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
+)
+_PROXY_LIST_TTL = 900.0  # refresh candidate list every 15 minutes
+
+
+def _curl_get_via_proxy(url: str, headers: dict, proxy: str) -> tuple[str, int]:
+    from curl_cffi import requests as curl_requests
+
+    resp = curl_requests.get(
+        url,
+        impersonate="chrome131",
+        headers=headers,
+        timeout=12.0,
+        allow_redirects=True,
+        proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
+    )
+    return resp.text, resp.status_code
+
+
+def _refresh_proxy_list() -> None:
+    import time as _time
+    import random as _random
+
+    now = _time.time()
+    if _PROXY_STATE["list"] and now - _PROXY_STATE["ts"] < _PROXY_LIST_TTL:
+        return
+    proxies: list[str] = []
+    for src in _PROXY_SOURCES:
+        try:
+            resp = httpx.get(src, timeout=15.0)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", line):
+                        proxies.append(line)
+        except Exception:
+            continue
+        if len(proxies) >= 80:
+            break
+    if proxies:
+        _random.shuffle(proxies)
+        _PROXY_STATE["list"] = list(dict.fromkeys(proxies))[:120]
+        _PROXY_STATE["ts"] = now
+
+
+def _proxy_candidates(limit: int = 18) -> list[str]:
+    """Known-good proxies first, then a random slice of the fresh list."""
+    import random as _random
+
+    good = [p for p in _PROXY_STATE["good"] if p in _PROXY_STATE["list"] or p]
+    rest = [p for p in _PROXY_STATE["list"] if p not in good]
+    _random.shuffle(rest)
+    return (good + rest)[:limit]
+
+
+async def _fetch_via_public_proxy(url: str) -> Optional[str]:
+    """Fetch article HTML through free public proxies with the social referer.
+
+    Tries proxies in parallel waves; returns the first response whose
+    extracted text looks like a real (non-paywalled) article.
+    """
+    _refresh_proxy_list()
+    candidates = _proxy_candidates()
+    if not candidates:
+        return None
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.facebook.com/",
+    }
+    loop = asyncio.get_running_loop()
+
+    async def attempt(proxy: str) -> tuple[str, int, str]:
+        try:
+            text, status = await loop.run_in_executor(
+                None, _curl_get_via_proxy, url, headers, proxy
+            )
+            return proxy, status, text
+        except Exception:
+            return proxy, 0, ""
+
+    for i in range(0, len(candidates), 6):
+        wave = candidates[i : i + 6]
+        results = await asyncio.gather(*(attempt(p) for p in wave))
+        for proxy, status, html in results:
+            if status != 200 or len(html) < 20000:
+                continue
+            page_text = await asyncio.to_thread(_extract_page_text, html)
+            words = len(page_text.split())
+            if words < 300 or _looks_blocked(html, page_text) or _looks_restricted(html, page_text):
+                continue
+            if proxy not in _PROXY_STATE["good"]:
+                _PROXY_STATE["good"].insert(0, proxy)
+                del _PROXY_STATE["good"][4:]
+            logger.info("public_proxy: %s via %s words=%s", url[:60], proxy, words)
+            return html
+    logger.info("public_proxy: no working proxy produced an article")
+    return None
+
+
 def _extract_embedded_text(html: str) -> str:
     """Pull article paragraphs out of embedded JSON payloads (WSJ and similar).
 
@@ -667,6 +778,24 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         break
                 except HTTPException:
                     continue
+
+        # 0.5 Public-proxy refetch — datacenter IPs (Render/AWS) are blocked
+        #     outright by some publishers (FT). A free public proxy provides
+        #     a non-blocked exit IP while keeping the social-referer trick.
+        if restricted and needs_more():
+            try:
+                proxied_html = await _fetch_via_public_proxy(final_url)
+                if proxied_html:
+                    proxied_text = await asyncio.to_thread(_extract_page_text, proxied_html)
+                    logger.info("public_proxy step: words=%s", len(proxied_text.split()))
+                    if proxied_text and len(proxied_text) > len(best_text) + 400:
+                        best_html, best_text, best_status, best_strategy = (
+                            proxied_html, proxied_text, 200, "public_proxy",
+                        )
+                        restricted = False
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+            except Exception as exc:
+                logger.warning("public_proxy step failed: %r", exc)
 
         # 1. AMP version — often served without the paywall.
         if needs_more():
