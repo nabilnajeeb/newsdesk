@@ -167,6 +167,12 @@ RECOVERED_NOTICE = (
     "a public archive or reader proxy."
 )
 
+HARD_PAYWALL_NOTICE = (
+    "This article is behind a hard paywall. The full text could not be "
+    "recovered from public archives or reader proxies from this server. "
+    "Open the original article or paste the text manually."
+)
+
 
 def _extract_main_text(html: str) -> str:
     if not html:
@@ -347,6 +353,8 @@ _PROXY_STATE: dict = {"list": [], "ts": 0.0, "good": []}
 _PROXY_SOURCES = (
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-LIST/master/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
 )
 _PROXY_LIST_TTL = 900.0  # refresh candidate list every 15 minutes
@@ -359,7 +367,7 @@ def _curl_get_via_proxy(url: str, headers: dict, proxy: str) -> tuple[str, int]:
         url,
         impersonate="chrome131",
         headers=headers,
-        timeout=12.0,
+        timeout=10.0,
         allow_redirects=True,
         proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
     )
@@ -384,19 +392,20 @@ def _refresh_proxy_list() -> None:
                         proxies.append(line)
         except Exception:
             continue
-        if len(proxies) >= 80:
+        if len(proxies) >= 150:
             break
     if proxies:
         _random.shuffle(proxies)
-        _PROXY_STATE["list"] = list(dict.fromkeys(proxies))[:120]
+        _PROXY_STATE["list"] = list(dict.fromkeys(proxies))[:200]
         _PROXY_STATE["ts"] = now
+        logger.info("proxy list refreshed: %s candidates", len(_PROXY_STATE["list"]))
 
 
-def _proxy_candidates(limit: int = 18) -> list[str]:
+def _proxy_candidates(limit: int = 24) -> list[str]:
     """Known-good proxies first, then a random slice of the fresh list."""
     import random as _random
 
-    good = [p for p in _PROXY_STATE["good"] if p in _PROXY_STATE["list"] or p]
+    good = [p for p in _PROXY_STATE["good"] if p]
     rest = [p for p in _PROXY_STATE["list"] if p not in good]
     _random.shuffle(rest)
     return (good + rest)[:limit]
@@ -411,6 +420,7 @@ async def _fetch_via_public_proxy(url: str) -> Optional[str]:
     _refresh_proxy_list()
     candidates = _proxy_candidates()
     if not candidates:
+        logger.info("public_proxy: no candidates available")
         return None
 
     headers = {
@@ -429,8 +439,8 @@ async def _fetch_via_public_proxy(url: str) -> Optional[str]:
         except Exception:
             return proxy, 0, ""
 
-    for i in range(0, len(candidates), 6):
-        wave = candidates[i : i + 6]
+    for i in range(0, len(candidates), 8):
+        wave = candidates[i : i + 8]
         results = await asyncio.gather(*(attempt(p) for p in wave))
         for proxy, status, html in results:
             if status != 200 or len(html) < 20000:
@@ -508,43 +518,56 @@ async def _find_snapshot_urls(
     snapshots: list[str] = []
     seen: set[str] = set()
 
+    # CDX matches URLs exactly, so tracking params (?syn=..., ?utm_...) break
+    # snapshot lookup. Try the exact URL first, then the canonical form.
+    parsed = urlparse(url)
+    canonical = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    cdx_urls = [url] if canonical == url else [url, canonical]
+
     # 1. Wayback CDX search — most reliable for WSJ/FT and returns newest first.
-    try:
-        resp = await client.get(
-            "https://web.archive.org/cdx/search/cdx",
-            params={
-                "url": url,
-                "output": "json",
-                "fl": "timestamp,statuscode",
-                "filter": "statuscode:200",
-                "limit": str(limit * 2),
-            },
-            timeout=30.0,
-        )
-        if resp.status_code == 200:
-            rows = resp.json()
-            newest = []
-            for row in rows[1:]:
-                if len(row) >= 2 and str(row[1]).startswith("2"):
-                    newest.append(row[0])
-            for ts in reversed(newest):
-                snap = f"https://web.archive.org/web/{ts}id_/{url}"
-                if snap not in seen:
-                    snapshots.append(snap)
-                    seen.add(snap)
-                    if len(snapshots) >= limit:
-                        return snapshots
-    except Exception:
-        pass
+    for cdx_url in cdx_urls:
+        if snapshots:
+            break
+        for attempt in range(2):  # one retry — CDX intermittently times out
+            try:
+                resp = await client.get(
+                    "https://web.archive.org/cdx/search/cdx",
+                    params={
+                        "url": cdx_url,
+                        "output": "json",
+                        "fl": "timestamp,statuscode",
+                        "filter": "statuscode:200",
+                        "limit": str(limit * 2),
+                    },
+                    timeout=40.0,
+                )
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    newest = []
+                    for row in rows[1:]:
+                        if len(row) >= 2 and str(row[1]).startswith("2"):
+                            newest.append(row[0])
+                    for ts in reversed(newest):
+                        snap = f"https://web.archive.org/web/{ts}id_/{cdx_url}"
+                        if snap not in seen:
+                            snapshots.append(snap)
+                            seen.add(snap)
+                            if len(snapshots) >= limit:
+                                return snapshots
+                    break
+            except Exception:
+                continue
 
     # 2. Wayback availability API (closest snapshot).
-    try:
-        wb = await _find_wayback_url(client, url)
-        if wb and wb not in seen:
-            snapshots.append(wb)
-            seen.add(wb)
-    except Exception:
-        pass
+    for candidate_url in cdx_urls:
+        try:
+            wb = await _find_wayback_url(client, candidate_url)
+            if wb and wb not in seen:
+                snapshots.append(wb)
+                seen.add(wb)
+                break
+        except Exception:
+            pass
 
     # 3. Memento aggregator (covers archive.today and regional archives).
     from datetime import datetime, timezone
@@ -883,9 +906,29 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         notice = None
         logger.info("fetch done: strategy=%s words=%s status=%s", best_strategy, len(best_text.split()), best_status)
         if direct_blocked and best_strategy == "direct":
-            raise HTTPException(
-                status_code=403,
-                detail="The publisher blocked automated access and no public archive copy was found. Open the original article or paste text you are authorized to read.",
+            # Graceful degradation: return the title with an honest notice
+            # instead of a hard 403 error.
+            meta = _extract_meta_fallback(html or "")
+            page_title = meta.get("title") or ""
+            notice = HARD_PAYWALL_NOTICE
+            best_html = (
+                f"<html><head><title>{html_lib.escape(page_title)}</title></head>"
+                f"<body><article><h1>{html_lib.escape(page_title)}</h1>"
+                f"<p><em>{html_lib.escape(notice)}</em></p></article></body></html>"
+            )
+            best_status = 403
+            partial = True
+            access_status = "restricted_preview"
+            logger.info("fetch done: all sources blocked, returning graceful notice")
+            return (
+                best_html,
+                best_status,
+                best_url,
+                best_strategy,
+                reader_mode,
+                partial,
+                access_status,
+                notice,
             )
 
         # Detect when the "recovered" text is actually paywall/subscription
@@ -903,11 +946,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         if is_paywall_pitch:
             access_status = "restricted_preview"
             partial = True
-            notice = (
-                "This article is behind a hard paywall. The full text could not be "
-                "recovered from public archives or reader proxies from this server. "
-                "Open the original article or paste the text manually."
-            )
+            notice = HARD_PAYWALL_NOTICE
         elif restricted and best_strategy == "direct":
             partial = True
             access_status = "restricted_preview"
@@ -1223,7 +1262,32 @@ async def api_extract(req: ExtractRequest):
         favor_recall=True,
     )
     if result is None:
-        raise HTTPException(status_code=422, detail="Could not extract article content")
+        # Tiny or synthetic pages (e.g. paywall notices) — fall back to the
+        # visible text instead of failing the UI flow with a 422.
+        meta = _extract_meta_fallback(req.html)
+        try:
+            visible = BeautifulSoup(req.html[:250000], "lxml").get_text(" ", strip=True)
+        except Exception:
+            visible = ""
+        if not visible.strip():
+            raise HTTPException(status_code=422, detail="Could not extract article content")
+        language = await asyncio.to_thread(_detect_language, visible)
+        if language:
+            language = language.split("-")[0].lower()
+        word_count = len(visible.split())
+        return ExtractResponse(
+            title=meta.get("title"),
+            author=meta.get("author"),
+            date=meta.get("date"),
+            text=visible,
+            description=meta.get("description"),
+            sitename=meta.get("sitename"),
+            language=language,
+            language_name=LANG_NAMES.get(language) if language else None,
+            word_count=word_count,
+            reading_minutes=max(1, round(word_count / 220)) if word_count else 0,
+            source_url=req.url,
+        )
 
     # trafilatura v1.x returns a dict; v2.x returns a Document object — handle both
     if isinstance(result, dict):
