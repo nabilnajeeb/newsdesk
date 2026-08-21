@@ -405,11 +405,13 @@ def _refresh_proxy_list() -> None:
         logger.info("proxy list refreshed: %s candidates", len(_PROXY_STATE["list"]))
 
 
-def _proxy_candidates(limit: int = 32) -> list[str]:
-    """Known-good proxies first, then a random slice of the fresh list."""
+def _proxy_candidates(limit: int = 40) -> list[str]:
+    """Known-good proxies first (rotated to avoid burning one IP), then a
+    random slice of the fresh list."""
     import random as _random
 
     good = [p for p in _PROXY_STATE["good"] if p]
+    _random.shuffle(good)
     rest = [p for p in _PROXY_STATE["list"] if p not in good]
     _random.shuffle(rest)
     return (good + rest)[:limit]
@@ -448,10 +450,16 @@ async def _fetch_via_public_proxy(url: str) -> Optional[str]:
         results = await asyncio.gather(*(attempt(p) for p in wave))
         for proxy, status, html in results:
             if status != 200 or len(html) < 20000:
+                # A cached "good" proxy that stopped working gets demoted so
+                # it doesn't keep failing at the front of the queue.
+                if proxy in _PROXY_STATE["good"]:
+                    _PROXY_STATE["good"].remove(proxy)
                 continue
             page_text = await asyncio.to_thread(_extract_page_text, html)
             words = len(page_text.split())
             if words < 300 or _looks_blocked(html, page_text) or _looks_restricted(html, page_text):
+                if proxy in _PROXY_STATE["good"]:
+                    _PROXY_STATE["good"].remove(proxy)
                 continue
             if proxy not in _PROXY_STATE["good"]:
                 _PROXY_STATE["good"].insert(0, proxy)
