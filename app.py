@@ -355,6 +355,8 @@ _PROXY_SOURCES = (
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
     "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-LIST/master/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
 )
 _PROXY_LIST_TTL = 900.0  # refresh candidate list every 15 minutes
@@ -363,13 +365,14 @@ _PROXY_LIST_TTL = 900.0  # refresh candidate list every 15 minutes
 def _curl_get_via_proxy(url: str, headers: dict, proxy: str) -> tuple[str, int]:
     from curl_cffi import requests as curl_requests
 
+    addr = proxy if "://" in proxy else f"http://{proxy}"
     resp = curl_requests.get(
         url,
         impersonate="chrome131",
         headers=headers,
-        timeout=10.0,
+        timeout=8.0,
         allow_redirects=True,
-        proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
+        proxies={"http": addr, "https": addr},
     )
     return resp.text, resp.status_code
 
@@ -383,25 +386,26 @@ def _refresh_proxy_list() -> None:
         return
     proxies: list[str] = []
     for src in _PROXY_SOURCES:
+        is_socks = src.endswith("socks5.txt")
         try:
             resp = httpx.get(src, timeout=15.0)
             if resp.status_code == 200:
                 for line in resp.text.splitlines():
                     line = line.strip()
                     if re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", line):
-                        proxies.append(line)
+                        proxies.append(f"socks5://{line}" if is_socks else line)
         except Exception:
             continue
-        if len(proxies) >= 150:
+        if len(proxies) >= 400:
             break
     if proxies:
         _random.shuffle(proxies)
-        _PROXY_STATE["list"] = list(dict.fromkeys(proxies))[:200]
+        _PROXY_STATE["list"] = list(dict.fromkeys(proxies))[:400]
         _PROXY_STATE["ts"] = now
         logger.info("proxy list refreshed: %s candidates", len(_PROXY_STATE["list"]))
 
 
-def _proxy_candidates(limit: int = 24) -> list[str]:
+def _proxy_candidates(limit: int = 32) -> list[str]:
     """Known-good proxies first, then a random slice of the fresh list."""
     import random as _random
 
@@ -907,9 +911,19 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         logger.info("fetch done: strategy=%s words=%s status=%s", best_strategy, len(best_text.split()), best_status)
         if direct_blocked and best_strategy == "direct":
             # Graceful degradation: return the title with an honest notice
-            # instead of a hard 403 error.
-            meta = _extract_meta_fallback(html or "")
-            page_title = meta.get("title") or ""
+            # instead of a hard 403 error. The title comes from jina's header
+            # (the publisher page itself is blocked and carries no metadata).
+            page_title = ""
+            try:
+                reader_url = f"https://r.jina.ai/{final_url}"
+                rbody, _rstatus, _ = await _fetch_html(
+                    client, reader_url, impersonate=False, reader_proxy=True
+                )
+                m = re.search(r"^Title:\s*(.+)", rbody, re.MULTILINE)
+                if m:
+                    page_title = m.group(1).strip()
+            except Exception:
+                pass
             notice = HARD_PAYWALL_NOTICE
             best_html = (
                 f"<html><head><title>{html_lib.escape(page_title)}</title></head>"
@@ -1323,6 +1337,14 @@ async def api_extract(req: ExtractRequest):
     embedded = _extract_embedded_text(req.html)
     if len(embedded) > len(cleaned_text) + 200:
         cleaned_text = _clean_extracted_text(embedded)
+
+    # Full publisher pages (e.g. FT fetched via proxy) can confuse bare
+    # extraction into returning the subscription pitch. The combined
+    # extractor used by /api/fetch handles these better — prefer it when it
+    # finds substantially more text.
+    combined = await asyncio.to_thread(_extract_page_text, req.html)
+    if len(combined) > len(cleaned_text) + 200:
+        cleaned_text = _clean_extracted_text(combined)
 
     if not language:
         language = await asyncio.to_thread(_detect_language, cleaned_text)
