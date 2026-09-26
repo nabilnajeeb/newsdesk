@@ -738,10 +738,16 @@ def _extract_embedded_text(html: str) -> str:
     blocks: list[str] = []
     seen: set[str] = set()
     for m in re.finditer(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', html):
+        raw = m.group(1)
+        # Decode via json.loads so BOTH literal UTF-8 and \uXXXX escapes
+        # come out right. (A blanket unicode_escape decode corrupts
+        # already-decoded UTF-8 into mojibake.)
         try:
-            t = m.group(1).encode().decode("unicode_escape", errors="ignore")
+            t = json.loads(f'"{raw}"')
         except Exception:
-            t = m.group(1)
+            t = raw
+        if not isinstance(t, str):
+            t = raw
         t = re.sub(r"\s+", " ", t).strip()
         if len(t) < 80:
             continue
@@ -1179,8 +1185,9 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     continue
             # Fallback when mirrors rate-limit this server's IP: fetch the
             # newest snapshot through ScraperAPI's egress IPs (1 credit).
-            # Skipped when direct mirrors already returned full-length text.
-            if needs_more() and len(best_text) < GOOD_TEXT_THRESHOLD and _scraperapi_key():
+            # Runs for any still-restricted best (length alone can't prove
+            # completeness), except when direct mirrors already won.
+            if needs_more() and restricted and best_strategy != "archive_today" and _scraperapi_key():
                 try:
                     at_prox = await _fetch_archivetoday_via_scraperapi(final_url)
                     if at_prox:
@@ -1324,6 +1331,16 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
             access_status = "restricted_preview"
             partial = True
             notice = HARD_PAYWALL_NOTICE
+        elif (
+            restricted
+            and best_strategy
+            in ("archive", "archive_today", "jina_reader", "public_proxy", "scraperapi", "syndicated")
+            and len(best_text.split()) >= 600
+        ):
+            # Long text from a recovery source is the complete article even
+            # when subscription furniture trips the marker check.
+            access_status = "recovered"
+            notice = RECOVERED_NOTICE
         elif restricted and _looks_restricted(best_html, best_text):
             # Substantive teaser: show it, but banner it as a preview with
             # recovery actions (the UI's partial-note path).
