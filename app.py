@@ -144,18 +144,44 @@ STRONG_RESTRICTION_MARKERS = (
     "subscribe to unlock", "subscribe to read", "create an account to read",
     "this article is for subscribers", "sign in to read",
     "register to continue", "to continue reading", "unlock this article",
-    "subscription required",
+    "subscription required", "content reserved for subscribers",
+    # French (Les Echos, Le Monde, Le Figaro, ...).
+    "contenu réservé aux abonnés", "contenu reserve aux abonnes",
+    "réservé aux abonnés", "reserve aux abonnes",
+    "pour lire la suite", "lire la suite de cet article",
+    "abonnez-vous pour lire", "article réservé",
+    # Spanish.
+    "contenido reservado", "suscríbete para seguir", "regístrate para seguir",
+    "artículo reservado", "articulo reservado", "suscribete para seguir",
+    # German.
+    "nur für abonnenten", "exklusiv für abonnenten",
+    "mit einem abo weiterlesen", "jetzt abonnieren",
+    # Italian.
+    "contenuto riservato", "abbonati per continuare", "articolo riservato",
 )
 
 SOFT_RESTRICTION_MARKERS = (
     "complete digital access", "for full access", "already a subscriber",
-    "unlimited access", "become a member",
+    "unlimited access", "become a member", "would you like to read more",
+    # French.
+    "déjà abonné", "deja abonne", "accès illimité", "acces illimite",
+    "offre découverte", "sans engagement", "la sélection", "la selection",
+    "envie de lire la suite",
+    # Spanish.
+    "acceso ilimitado", "ya eres suscriptor",
+    # German.
+    "bereits abonnent", "unbegrenzter zugang",
+    # Italian.
+    "accesso illimitato", "già abbonato", "gia abbonato",
 )
 
 BLOCK_PAGE_MARKERS = (
     "verify you are human", "complete the captcha", "captcha challenge",
     "checking your browser", "just a moment...", "access denied",
     "request blocked", "cf-chl-", "attention required! | cloudflare",
+    # PerimeterX / HUMAN bot-defense pages (NYT, ...).
+    "please enable js and disable any ad blocker", "press & hold",
+    "press and hold", "human challenge", "perimeterx",
 )
 
 RESTRICTED_NOTICE = (
@@ -201,7 +227,15 @@ def _looks_blocked(html: str, extracted_text: str) -> bool:
 
 
 def _looks_restricted(html: str, extracted_text: str) -> bool:
-    """Classify a subscriber preview without letting footer copy inflate it."""
+    """Classify a subscriber preview without letting footer copy inflate it.
+
+    A full-length extraction is never a preview — even when the page carries
+    subscription furniture or an isAccessibleForFree:false flag (NYT embeds
+    the whole body while gating client-side).
+    """
+    article_words = len(extracted_text.split())
+    if article_words >= GOOD_TEXT_THRESHOLD:
+        return False
     if re.search(r'"isAccessibleForFree"\s*:\s*false', html[:500000], flags=re.IGNORECASE):
         return True
     try:
@@ -213,10 +247,30 @@ def _looks_restricted(html: str, extracted_text: str) -> bool:
     soft_hits = sum(marker in sample for marker in SOFT_RESTRICTION_MARKERS)
     if strong_hits == 0 and soft_hits == 0:
         return False
-    article_words = len(extracted_text.split())
     return (strong_hits >= 1 and article_words < 1200) or (
         strong_hits + soft_hits >= 2 and article_words < 800
     )
+
+
+def _title_from_slug(url: str) -> str:
+    """Derive a readable title from a slug-style article URL (last resort).
+
+    Returns "" for UUID-style slugs (FT) or stubs too short to be useful.
+    """
+    try:
+        path = urlparse(url).path
+        seg = [s for s in path.split("/") if s][-1]
+        seg = re.sub(r"\.\w+$", "", seg)
+        seg = re.sub(r"[-_]+", " ", seg).strip()
+        seg = re.sub(r"\s+\d{4,}$", "", seg).strip()
+        if len(seg) < 12 or " " not in seg:
+            return ""
+        if re.fullmatch(r"[0-9a-f\- ]{20,}", seg):
+            return ""
+        words = seg.split()
+        return " ".join(w if w.isupper() else w.capitalize() for w in words)[:160]
+    except Exception:
+        return ""
 
 
 async def _validate_public_url(url: str) -> str:
@@ -602,7 +656,7 @@ async def _find_syndicated_copy(
     async def _fetch_one(cbm_url: str):
         try:
             return await _fetch_html(client, cbm_url, impersonate=False)
-        except HTTPException:
+        except Exception:
             return None
 
     # Resolve + download candidates in parallel (serial would blow the
@@ -949,9 +1003,9 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         reader_mode = False
         recovered = len(direct_text) >= GOOD_TEXT_THRESHOLD
 
-        needs_more = lambda: not recovered and (
-            len(best_text) < GOOD_TEXT_THRESHOLD or restricted
-        )
+        # NOTE: a long teaser can exceed GOOD_TEXT_THRESHOLD (chars) while
+        # still being restricted — keep digging while restricted is set.
+        needs_more = lambda: len(best_text) < GOOD_TEXT_THRESHOLD or restricted
 
         # 0. Social-media referrer refetch — many paywalled publishers
         #    (notably FT) serve the full article when the Referer header
@@ -974,10 +1028,13 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         best_html, best_text, best_url, best_status, best_strategy = (
                             ref_html, ref_text, ref_url_resolved, ref_status, "social_referrer",
                         )
-                        restricted = False
+                        # Recompute — a long teaser (e.g. French freemium
+                        # previews) still carries paywall markers.
+                        restricted = _looks_restricted(ref_html, ref_text)
                         recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
-                        break
-                except HTTPException:
+                        if recovered and not restricted:
+                            break
+                except Exception:
                     continue
 
         # 0.6 ScraperAPI — rotating exit IPs plus forwarded social referer
@@ -1028,7 +1085,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                             amp_html, amp_text, resolved_amp, amp_status, "amp",
                         )
                         recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
-                except HTTPException:
+                except Exception:
                     pass
 
         # 2. Public archive captures (Wayback CDX + availability + Memento).
@@ -1049,10 +1106,12 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
                         if recovered:
                             break
-                except HTTPException:
+                except Exception:
                     continue
 
         # 3. archive.today newest snapshot (works from many networks).
+        # NOTE: plain fetch — TLS impersonation buys nothing here and its
+        # 45s timeout stalls the ladder on slow mirrors.
         if needs_more():
             for mirror in ("archive.ph", "archive.today", "archive.vn"):
                 if not needs_more():
@@ -1060,7 +1119,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                 try:
                     at_url = f"https://{mirror}/newest/{final_url}"
                     at_html, at_status, at_resolved = await _fetch_html(
-                        client, at_url, impersonate=True
+                        client, at_url, impersonate=False
                     )
                     at_text = await _better_text(at_html, len(best_text))
                     if at_text:
@@ -1071,7 +1130,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
                         if recovered:
                             break
-                except HTTPException:
+                except Exception:
                     continue
 
         # 4. Reader proxy (renders the page server-side).
@@ -1098,7 +1157,7 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
                 else:
                     logger.info("jina_reader: status=%s (error/empty response, skipped)", _status)
-            except HTTPException:
+            except Exception:
                 pass
 
         # 5. Same-story syndicated copy — find the story on a free outlet
@@ -1143,6 +1202,8 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     page_title = m.group(1).strip()
             except Exception:
                 pass
+            if not page_title or (" " not in page_title and "." in page_title):
+                page_title = _title_from_slug(final_url)
             notice = HARD_PAYWALL_NOTICE
             best_html = (
                 f"<html><head><title>{html_lib.escape(page_title)}</title></head>"
@@ -1164,23 +1225,38 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                 notice,
             )
 
-        # Detect when the "recovered" text is actually paywall/subscription
-        # pitch rather than real article content (common with FT on Wayback).
-        _PAYWALL_TEXT_MARKERS = (
+        # Distinguish a real (if partial) teaser from a pure paywall pitch:
+        # strip blocks containing subscription boilerplate and count what
+        # remains. Pitch-only pages get the hard-paywall notice; substantive
+        # teasers are shown with the standard restricted-preview banner.
+        _PITCH_MARKERS = (
             "subscribe to unlock", "try unlimited access", "complete digital access",
             "explore more offers", "standard digital", "premium digital",
             "save 40%", "save now on essential", "then $75 per month",
-            "only $1 for 4 weeks",
+            "only $1 for 4 weeks", "subscribe for full access",
+            "contenu réservé aux abonnés", "contenu reserve aux abonnes",
+            "réservé aux abonnés", "reserve aux abonnes",
+            "abonnez-vous", "abonnez vous", "la sélection", "la selection",
+            "envie de lire la suite", "pour lire la suite",
+            "déjà abonné", "deja abonne", "sans engagement",
+            "contenido reservado", "suscríbete", "suscribete",
+            "nur für abonnenten", "jetzt abonnieren",
+            "contenuto riservato", "abbonati per",
         )
-        best_lower = best_text.lower()
-        paywall_text_hits = sum(1 for m in _PAYWALL_TEXT_MARKERS if m in best_lower)
-        is_paywall_pitch = paywall_text_hits >= 2 and len(best_text.split()) < 400
+        _pitch_lc = tuple(m.lower() for m in _PITCH_MARKERS)
+        _kept = [
+            b for b in re.split(r"\n{2,}", best_text)
+            if b.strip() and not any(m in b.lower() for m in _pitch_lc)
+        ]
+        substantive_words = len(" ".join(_kept).split())
 
-        if is_paywall_pitch:
+        if restricted and substantive_words < 80:
             access_status = "restricted_preview"
             partial = True
             notice = HARD_PAYWALL_NOTICE
-        elif restricted and best_strategy == "direct":
+        elif restricted and _looks_restricted(best_html, best_text):
+            # Substantive teaser: show it, but banner it as a preview with
+            # recovery actions (the UI's partial-note path).
             partial = True
             access_status = "restricted_preview"
             notice = RESTRICTED_NOTICE
