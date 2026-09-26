@@ -1287,9 +1287,12 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
             )
 
         # Distinguish a real (if partial) teaser from a pure paywall pitch:
-        # strip blocks containing subscription boilerplate and count what
-        # remains. Pitch-only pages get the hard-paywall notice; substantive
-        # teasers are shown with the standard restricted-preview banner.
+        # Distinguish a real (if partial) teaser from a pure paywall pitch:
+        # drop individual sentences carrying subscription boilerplate and
+        # count what remains. Pitch-only pages get the hard-paywall notice;
+        # substantive teasers are shown with the restricted-preview banner.
+        # (Sentence-level: trafilatura often returns the teaser as one block,
+        # so block-level ratios cannot separate content from pitch.)
         _PITCH_MARKERS = (
             "subscribe to unlock", "try unlimited access", "complete digital access",
             "explore more offers", "standard digital", "premium digital",
@@ -1305,13 +1308,19 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
             "contenuto riservato", "abbonati per",
         )
         _pitch_lc = tuple(m.lower() for m in _PITCH_MARKERS)
-        _kept = [
-            b for b in re.split(r"\n{2,}", best_text)
-            if b.strip() and not any(m in b.lower() for m in _pitch_lc)
+        _sentences = [
+            s.strip() for s in re.split(r"(?<=[.!?…])\s+", best_text) if s.strip()
         ]
-        substantive_words = len(" ".join(_kept).split())
+        _substantive_words = len(" ".join(
+            s for s in _sentences if not any(m in s.lower() for m in _pitch_lc)
+        ).split())
+        _total_words = len(best_text.split())
+        logger.info(
+            "classify: strategy=%s words=%s substantive=%s restricted=%s",
+            best_strategy, _total_words, _substantive_words, restricted,
+        )
 
-        if restricted and substantive_words < 80:
+        if restricted and _substantive_words < 80:
             access_status = "restricted_preview"
             partial = True
             notice = HARD_PAYWALL_NOTICE
