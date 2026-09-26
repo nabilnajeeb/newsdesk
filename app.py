@@ -1657,6 +1657,35 @@ def _call_mymemory_translate(text: str, src: str, tgt: str) -> str:
     return MyMemoryTranslator(source=_to_locale(src), target=_to_locale(tgt)).translate(text)
 
 
+def _call_google_via_scraperapi(text: str, src: str, tgt: str) -> str:
+    """Translate via Google's endpoint routed through ScraperAPI egress IPs.
+
+    Costs 1 ScraperAPI credit per call — last resort for throttled networks.
+    """
+    from urllib.parse import quote_plus
+
+    key = _scraperapi_key()
+    if not key:
+        raise RuntimeError("no ScraperAPI key configured")
+    gtx = (
+        "https://translate.googleapis.com/translate_a/single"
+        f"?client=gtx&sl={quote_plus(src or 'auto')}&tl={quote_plus(tgt)}"
+        f"&dt=t&q={quote_plus(text)}"
+    )
+    resp = httpx.get(
+        "http://api.scraperapi.com",
+        params={"api_key": key, "url": gtx},
+        timeout=45.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    parts = [seg[0] for seg in (data[0] or []) if seg and seg[0]]
+    out = "".join(parts).strip()
+    if not out:
+        raise RuntimeError("empty ScraperAPI translation response")
+    return out
+
+
 async def _translate_text(text: str, src: str, tgt: str) -> str:
     """Translate with caching, pacing, retries, and provider fallback.
 
@@ -1692,13 +1721,18 @@ async def _translate_text(text: str, src: str, tgt: str) -> str:
 
     # Fallback provider: MyMemory (needs an explicit source language).
     fb_src = src if src and src != "auto" else (_detect_language(text) or "en")
-    try:
-        out = await asyncio.to_thread(_call_mymemory_translate, text, fb_src, tgt)
-        if out:
-            _TRANSLATE_CACHE[key] = out
-            return out
-    except Exception as exc:
-        last_exc = exc
+    for _fallback in (
+        lambda: _call_mymemory_translate(text, fb_src, tgt),
+        lambda: _call_google_via_scraperapi(text, fb_src, tgt),
+    ):
+        try:
+            out = await asyncio.to_thread(_fallback)
+            if out:
+                _TRANSLATE_CACHE[key] = out
+                return out
+        except Exception as exc:
+            last_exc = exc
+            continue
     logger.warning("translation failed after retries/fallback: %r", last_exc)
     raise HTTPException(
         status_code=429,
