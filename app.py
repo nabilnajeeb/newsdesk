@@ -474,6 +474,50 @@ async def _fetch_via_public_proxy(url: str) -> Optional[str]:
     return None
 
 
+def _scraperapi_key() -> str:
+    """ScraperAPI key from the SCRAPERAPI_KEY env var (never logged)."""
+    return os.environ.get("SCRAPERAPI_KEY", "").strip()
+
+
+async def _fetch_via_scraperapi(url: str) -> Optional[str]:
+    """Fetch article HTML through ScraperAPI with a forwarded social referer.
+
+    ScraperAPI exits from rotating (non-blocked) IPs and, with
+    keep_headers=true, forwards our Facebook Referer to the publisher —
+    the combination that unlocks FT's full article server-side.
+    Each attempt costs 1 API credit, so callers must gate on restricted.
+    """
+    key = _scraperapi_key()
+    if not key:
+        return None
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.facebook.com/",
+    }
+    try:
+        resp = await asyncio.to_thread(
+            httpx.get,
+            "http://api.scraperapi.com",
+            params={"api_key": key, "url": url, "keep_headers": "true"},
+            headers=headers,
+            timeout=60.0,
+        )
+    except Exception as exc:
+        logger.info("scraperapi: request failed: %r", exc)
+        return None
+    if resp.status_code != 200 or len(resp.text) < 20000:
+        logger.info("scraperapi: status=%s bytes=%s", resp.status_code, len(resp.text))
+        return None
+    page_text = await asyncio.to_thread(_extract_page_text, resp.text)
+    words = len(page_text.split())
+    if words < 300 or _looks_blocked(resp.text, page_text) or _looks_restricted(resp.text, page_text):
+        logger.info("scraperapi: rejected (words=%s)", words)
+        return None
+    logger.info("scraperapi: full article words=%s", words)
+    return resp.text
+
+
 SYNDICATED_NOTICE = (
     "The publisher restricts this article, so NewsDesk fetched the same "
     "story from another outlet."
@@ -933,6 +977,24 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                         break
                 except HTTPException:
                     continue
+
+        # 0.6 ScraperAPI — rotating exit IPs plus forwarded social referer
+        #     (1 credit/attempt; skipped when no SCRAPERAPI_KEY is set).
+        #     Jumped ahead of the free-proxy lottery: reliable and faster.
+        if restricted and needs_more() and _scraperapi_key():
+            try:
+                scraped_html = await _fetch_via_scraperapi(final_url)
+                if scraped_html:
+                    scraped_text = await asyncio.to_thread(_extract_page_text, scraped_html)
+                    logger.info("scraperapi step: words=%s", len(scraped_text.split()))
+                    if scraped_text and len(scraped_text) > len(best_text) + 400:
+                        best_html, best_text, best_status, best_strategy = (
+                            scraped_html, scraped_text, 200, "scraperapi",
+                        )
+                        restricted = False
+                        recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+            except Exception as exc:
+                logger.warning("scraperapi step failed: %r", exc)
 
         # 0.5 Public-proxy refetch — datacenter IPs (Render/AWS) are blocked
         #     outright by some publishers (FT). A free public proxy provides
