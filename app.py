@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html as html_lib
 import ipaddress
 import json
@@ -6,6 +7,7 @@ import logging
 import os
 import re
 import socket
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -1594,11 +1596,11 @@ async def api_translate(req: TranslateRequest):
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="No text to translate")
-
-    translator = GoogleTranslator(source=req.source_lang, target=req.target_lang)
+    if len(text) > 60000:
+        raise HTTPException(status_code=400, detail="Text too long to translate in one go")
 
     if len(text) <= 4500:
-        translated = await asyncio.to_thread(translator.translate, text)
+        translated = await _translate_text(text, req.source_lang, req.target_lang)
         return TranslateResponse(
             translated_text=translated,
             source_lang=req.source_lang,
@@ -1608,13 +1610,99 @@ async def api_translate(req: TranslateRequest):
     chunks = _chunk_text(text)
     translated_chunks: list[str] = []
     for chunk in chunks:
-        result = await asyncio.to_thread(translator.translate, chunk)
-        translated_chunks.append(result or "")
+        translated_chunks.append(await _translate_text(chunk, req.source_lang, req.target_lang))
 
     return TranslateResponse(
         translated_text="\n\n".join(translated_chunks),
         source_lang=req.source_lang,
         target_lang=req.target_lang,
+    )
+
+
+_TRANSLATE_CACHE: dict = {}
+_TRANSLATE_LOCK = asyncio.Lock()
+_TRANSLATE_LAST_CALL = 0.0
+
+
+def _translate_cache_key(text: str, src: str, tgt: str) -> str:
+    return hashlib.sha1(f"{src}|{tgt}|{text}".encode("utf-8", "ignore")).hexdigest()
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in msg
+        for marker in ("429", "too many", "rate limit", "rate-limit", "ratelimit",
+                       "quota", "temporarily", "overloaded", "503", "try again")
+    )
+
+
+def _call_google_translate(text: str, src: str, tgt: str) -> str:
+    from deep_translator import GoogleTranslator
+
+    return GoogleTranslator(source=src or "auto", target=tgt).translate(text)
+
+
+def _call_mymemory_translate(text: str, src: str, tgt: str) -> str:
+    from deep_translator import MyMemoryTranslator
+    from deep_translator.constants import MY_MEMORY_LANGUAGES_TO_CODES
+
+    def _to_locale(code: str) -> str:
+        code = (code or "").lower()
+        for _code in MY_MEMORY_LANGUAGES_TO_CODES.values():
+            if _code.split("-")[0].lower() == code:
+                return _code
+        return code
+
+    return MyMemoryTranslator(source=_to_locale(src), target=_to_locale(tgt)).translate(text)
+
+
+async def _translate_text(text: str, src: str, tgt: str) -> str:
+    """Translate with caching, pacing, retries, and provider fallback.
+
+    Google's free endpoint throttles shared datacenter IPs aggressively, so
+    calls are serialized with a minimum interval, retried with backoff on
+    rate-limit errors, and finally fall back to MyMemory.
+    """
+    global _TRANSLATE_LAST_CALL
+    key = _translate_cache_key(text, src, tgt)
+    if key in _TRANSLATE_CACHE:
+        return _TRANSLATE_CACHE[key]
+    if len(_TRANSLATE_CACHE) > 1000:
+        _TRANSLATE_CACHE.clear()
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        async with _TRANSLATE_LOCK:
+            wait = 0.4 - (time.monotonic() - _TRANSLATE_LAST_CALL)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                out = await asyncio.to_thread(_call_google_translate, text, src, tgt)
+            except Exception as exc:
+                out = None
+                last_exc = exc
+            _TRANSLATE_LAST_CALL = time.monotonic()
+        if out:
+            _TRANSLATE_CACHE[key] = out
+            return out
+        if last_exc is not None and not _is_rate_limit_error(last_exc):
+            break
+        await asyncio.sleep(0.6 * (2 ** attempt))
+
+    # Fallback provider: MyMemory (needs an explicit source language).
+    fb_src = src if src and src != "auto" else (_detect_language(text) or "en")
+    try:
+        out = await asyncio.to_thread(_call_mymemory_translate, text, fb_src, tgt)
+        if out:
+            _TRANSLATE_CACHE[key] = out
+            return out
+    except Exception as exc:
+        last_exc = exc
+    logger.warning("translation failed after retries/fallback: %r", last_exc)
+    raise HTTPException(
+        status_code=429,
+        detail="Translation service is busy. Please wait a moment and try again.",
     )
 
 # ---------------------------------------------------------------------------
