@@ -574,6 +574,44 @@ async def _fetch_via_scraperapi(url: str) -> Optional[str]:
     return resp.text
 
 
+async def _fetch_archivetoday_via_scraperapi(url: str) -> Optional[str]:
+    """Fetch an archive.today snapshot through ScraperAPI (1 credit/mirror).
+
+    archive.today rate-limits datacenter IPs (429); ScraperAPI's egress IPs
+    usually pass. Snapshots often contain the full article text even when
+    the live page is paywalled.
+    """
+    key = _scraperapi_key()
+    if not key:
+        return None
+    for mirror in ("archive.ph", "archive.today", "archive.vn"):
+        try:
+            resp = await asyncio.to_thread(
+                httpx.get,
+                "http://api.scraperapi.com",
+                params={"api_key": key, "url": f"https://{mirror}/newest/{url}"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=60.0,
+            )
+        except Exception as exc:
+            logger.info("archivetoday-scraperapi %s failed: %r", mirror, exc)
+            continue
+        if resp.status_code != 200 or len(resp.text) < 20000:
+            logger.info(
+                "archivetoday-scraperapi %s: status=%s bytes=%s",
+                mirror, resp.status_code, len(resp.text),
+            )
+            continue
+        text = await asyncio.to_thread(_extract_page_text, resp.text)
+        words = len(text.split())
+        if words < 300 or _looks_blocked(resp.text, text):
+            logger.info("archivetoday-scraperapi %s: rejected words=%s", mirror, words)
+            continue
+        logger.info("archivetoday-scraperapi %s: words=%s", mirror, words)
+        return resp.text
+    return None
+
+
 SYNDICATED_NOTICE = (
     "The publisher restricts this article, so NewsDesk fetched the same "
     "story from another outlet."
@@ -898,13 +936,20 @@ def _process_jina_response(body: str) -> Optional[tuple[str, str]]:
     if re.search(r"Warning:.*(?:error|CAPTCHA|blocked|forbidden|not found)", head, re.IGNORECASE):
         return None
 
-    # Detect hard paywall pages (FT, WSJ, etc.) where jina only gets the
-    # subscription pitch — no article body is present.
+    # Detect hard paywall pages (FT, WSJ, Les Echos, ...) where jina only
+    # gets the subscription pitch — no article body is present.
     _PAYWALL_MARKERS = (
         "subscribe to unlock", "try unlimited access", "then $75 per month",
         "only $1 for 4 weeks", "complete digital access",
         "explore more offers", "standard digital", "premium digital",
         "subscribe for full access", "to continue reading",
+        "contenu réservé aux abonnés", "contenu reserve aux abonnes",
+        "réservé aux abonnés", "reserve aux abonnes",
+        "abonnez-vous", "abonnez vous", "la sélection", "la selection",
+        "envie de lire la suite", "déjà abonné", "deja abonne",
+        "sans engagement", "contenido reservado", "suscríbete",
+        "nur für abonnenten", "jetzt abonnieren",
+        "contenuto riservato", "abbonati per",
     )
     body_lower = body[:15000].lower()
     paywall_hits = sum(1 for m in _PAYWALL_MARKERS if m in body_lower)
@@ -1132,6 +1177,22 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                             break
                 except Exception:
                     continue
+            # Fallback when mirrors rate-limit this server's IP: fetch the
+            # newest snapshot through ScraperAPI's egress IPs (1 credit).
+            # Skipped when direct mirrors already returned full-length text.
+            if needs_more() and len(best_text) < GOOD_TEXT_THRESHOLD and _scraperapi_key():
+                try:
+                    at_prox = await _fetch_archivetoday_via_scraperapi(final_url)
+                    if at_prox:
+                        at_prox_text = await _better_text(at_prox, len(best_text))
+                        logger.info("archive_today-scraperapi: words=%s", len(at_prox_text.split()) if at_prox_text else 0)
+                        if at_prox_text:
+                            best_html, best_text, best_url, best_status, best_strategy = (
+                                at_prox, at_prox_text, final_url, 200, "archive_today",
+                            )
+                            recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
+                except Exception:
+                    pass
 
         # 4. Reader proxy (renders the page server-side).
         # NOTE: r.jina.ai refuses browser-like fingerprints (curl_cffi
