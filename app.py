@@ -357,6 +357,10 @@ _PROXY_SOURCES = (
     "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-LIST/master/socks5.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all",
 )
 _PROXY_LIST_TTL = 900.0  # refresh candidate list every 15 minutes
@@ -386,7 +390,7 @@ def _refresh_proxy_list() -> None:
         return
     proxies: list[str] = []
     for src in _PROXY_SOURCES:
-        is_socks = src.endswith("socks5.txt")
+        is_socks = "socks5" in src
         try:
             resp = httpx.get(src, timeout=15.0)
             if resp.status_code == 200:
@@ -463,10 +467,126 @@ async def _fetch_via_public_proxy(url: str) -> Optional[str]:
                 continue
             if proxy not in _PROXY_STATE["good"]:
                 _PROXY_STATE["good"].insert(0, proxy)
-                del _PROXY_STATE["good"][4:]
+                del _PROXY_STATE["good"][6:]
             logger.info("public_proxy: %s via %s words=%s", url[:60], proxy, words)
             return html
     logger.info("public_proxy: no working proxy produced an article")
+    return None
+
+
+SYNDICATED_NOTICE = (
+    "The publisher restricts this article, so NewsDesk fetched the same "
+    "story from another outlet."
+)
+
+# Outlets known to be free-to-read full text (syndication targets).
+_SYNDICATION_PREFERRED = (
+    "msn.com", "yahoo.com", "aol.com", "marketwatch.com",
+    "marketscreener.com", "zonebourse.com", "investing.com",
+    "morningstar.com", "financialpost.com", "headtopics.com",
+    "cnbc.com", "reuters.com", "apnews.com", "theguardian.com",
+    "bbc.com", "france24.com", "euronews.com",
+)
+
+# Domains that are themselves hard-paywalled — never useful as fallback.
+_SYNDICATION_SKIP = (
+    "ft.com", "wsj.com", "barrons.com", "bloomberg.com",
+    "economist.com", "nytimes.com", "washingtonpost.com",
+    "thetimes.com", "telegraph.co.uk",     "lemonde.fr", "lesechos.fr",
+    "lexpress.fr", "lefigaro.fr", "liberation.fr",
+)
+
+
+def _headline_keywords(headline: str) -> set[str]:
+    stop = {
+        "the", "a", "an", "in", "on", "of", "to", "for", "and", "or",
+        "as", "at", "by", "with", "from", "le", "la", "les", "des",
+        "de", "du", "un", "une", "et", "en", "au", "aux", "sur", "dans",
+    }
+    return {
+        w.strip("“”\"'’.,:;!?()").lower()
+        for w in re.split(r"\s+", headline or "")
+        if len(w.strip("“”\"'’.,:;!?()")) > 3
+    } - stop
+
+
+async def _find_syndicated_copy(
+    client: httpx.AsyncClient, headline: str, own_host: str
+) -> Optional[tuple[str, int, str]]:
+    """Find the same story on a free outlet via Google News RSS.
+
+    Returns (html, status, resolved_url) for the first candidate whose
+    extracted text is a full, non-paywalled article matching the headline.
+    """
+    keywords = _headline_keywords(headline)
+    if len(keywords) < 3:
+        return None
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    try:
+        resp = await client.get(
+            "https://news.google.com/rss/search",
+            params={"q": f'"{headline}"', "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            timeout=20.0,
+        )
+        if resp.status_code == 200:
+            for link in re.findall(
+                r"<link>(https?://news\.google\.com/rss/articles/[^<]+)</link>",
+                resp.text,
+            ):
+                link = link.replace("&amp;", "&")
+                if link not in seen:
+                    seen.add(link)
+                    candidates.append(link)
+    except Exception as exc:
+        logger.info("syndicated: gnews rss failed: %r", exc)
+        return None
+
+    if not candidates:
+        logger.info("syndicated: no cluster links for headline")
+        return None
+
+    def host_of(u: str) -> str:
+        try:
+            return urlparse(u).netloc.lower()
+        except Exception:
+            return ""
+
+    async def _fetch_one(cbm_url: str):
+        try:
+            return await _fetch_html(client, cbm_url, impersonate=False)
+        except HTTPException:
+            return None
+
+    # Resolve + download candidates in parallel (serial would blow the
+    # request time budget); validate in order and take the first good copy.
+    fetched = await asyncio.gather(*(_fetch_one(u) for u in candidates[:6]))
+    for got in fetched:
+        if not got:
+            continue
+        html, status, resolved = got
+        rhost = host_of(resolved)
+        if not rhost or "consent.google.com" in rhost or "news.google.com" in rhost:
+            continue
+        if own_host and own_host in rhost:
+            continue
+        if any(skip in rhost for skip in _SYNDICATION_SKIP):
+            continue
+        page_text = await asyncio.to_thread(_extract_page_text, html)
+        words = len(page_text.split())
+        lowered = page_text.lower()
+        hits = sum(1 for kw in keywords if kw in lowered)
+        logger.info(
+            "syndicated: candidate=%s words=%s kw_hits=%s/%s",
+            resolved[:80], words, hits, len(keywords),
+        )
+        if words < 350 or hits < 3:
+            continue
+        if _looks_blocked(html, page_text) or _looks_restricted(html, page_text):
+            continue
+        return html, status, resolved
+    logger.info("syndicated: no usable free copy found")
     return None
 
 
@@ -893,10 +1013,14 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         # 4. Reader proxy (renders the page server-side).
         # NOTE: r.jina.ai refuses browser-like fingerprints (curl_cffi
         # impersonation or rich UA headers) with 403, so fetch it plainly.
+        page_headline = None
         if needs_more():
             reader_url = f"https://r.jina.ai/{final_url}"
             try:
                 reader_body, _status, _ = await _fetch_html(client, reader_url, impersonate=False, reader_proxy=True)
+                _mtitle = re.search(r"^Title:\s*(.+)", reader_body, re.MULTILINE)
+                if _mtitle:
+                    page_headline = _mtitle.group(1).strip()
                 processed = _process_jina_response(reader_body)
                 if processed:
                     _jina_title, reader_html = processed
@@ -912,6 +1036,29 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
                     logger.info("jina_reader: status=%s (error/empty response, skipped)", _status)
             except HTTPException:
                 pass
+
+        # 5. Same-story syndicated copy — find the story on a free outlet
+        #    via Google News RSS (headline needed; comes from jina or page
+        #    metadata). Rescues hard paywalls like FT's registration wall.
+        if restricted and needs_more():
+            if not page_headline:
+                page_headline = _extract_meta_fallback(best_html).get("title")
+            if page_headline:
+                own_host = ""
+                try:
+                    own_host = urlparse(final_url).netloc.lower()
+                except Exception:
+                    pass
+                synd = await _find_syndicated_copy(client, page_headline, own_host)
+                if synd:
+                    synd_html, synd_status, synd_url = synd
+                    synd_text = await asyncio.to_thread(_extract_page_text, synd_html)
+                    logger.info("syndicated: url=%s words=%s", synd_url[:80], len(synd_text.split()))
+                    best_html, best_text, best_url, best_status, best_strategy = (
+                        synd_html, synd_text, synd_url, synd_status, "syndicated",
+                    )
+                    restricted = False
+                    recovered = len(best_text) >= GOOD_TEXT_THRESHOLD
 
         partial = False
         access_status = "public"
@@ -976,6 +1123,9 @@ async def fetch_article(url: str) -> tuple[str, int, str, str, bool, bool, str, 
         elif restricted:
             access_status = "recovered"
             notice = RECOVERED_NOTICE
+        elif best_strategy == "syndicated":
+            access_status = "recovered"
+            notice = SYNDICATED_NOTICE
         elif not best_text.strip():
             notice = "The page loaded, but no readable article body was found."
         return (
